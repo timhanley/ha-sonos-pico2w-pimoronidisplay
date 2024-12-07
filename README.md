@@ -35,7 +35,7 @@ A MicroPython application for controlling Sonos speakers via Home Assistant usin
 
 ## Setup
 
-1. Copy main.py and the LICENCE.txt file to your Pico W which needs to be running the Pimoroni micropython https://github.com/pimoroni/pimoroni-pico-rp2350/releases or have the pico display pack libraries installed on vanilla micropython.   
+1. Copy main.py and the LICENCE.txt file to your Pico W which needs to be running Pimoroni micropython https://github.com/pimoroni/pimoroni-pico-rp2350/releases or install the Pimoroni pico display pack libraries on vanilla micropython.   
 2. Update the WiFi and Home Assistant configuration near the top of main.py
 3. Ensure Home Assistant has the Sonos integration installed and properly configured
 4. Reset the Pico W to start the application
