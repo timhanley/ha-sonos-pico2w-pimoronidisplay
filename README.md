@@ -1,8 +1,8 @@
-# Home Assistant Sonos Display Controller / Remote - Raspberry Pi Pico 2 W
+# Home Assistant Sonos Remote Control with Display
 
-A MicroPython application for controlling Sonos speakers via Home Assistant using a Pimoroni Pico Display Pack 2.
+A MicroPython application for controlling Sonos speakers via Home Assistant using a Pimoroni Pico Display Pack 2 and a Raspberry Pi Pico 2 W.
 
-![Main Interface](screenshots/main.jpg)
+![Main Interface](screenshots/main.jpeg)
 
 ## Features
 
@@ -17,16 +17,16 @@ A MicroPython application for controlling Sonos speakers via Home Assistant usin
 ## Screenshots
 
 ### Main Playback Screen
-![Main Playback](screenshots/main.jpg)
+![Main Playback](screenshots/main.jpeg)
 
 ### Menu
 ![Menu](screenshots/menu.jpg)
 
 ### Speaker Selection
-![Speaker Selection](screenshots/speakers.jpg)
+![Speaker Selection](screenshots/speakers.jpeg)
 
 ### Brightness Control
-![Brightness](screenshots/brightness.jpg)
+![Brightness](screenshots/brightness.jpeg)
 
 ## Hardware Requirements
 
@@ -35,15 +35,15 @@ A MicroPython application for controlling Sonos speakers via Home Assistant usin
 
 ## Setup
 
-1. Copy main.py and the LICENCE file to your Pico W which needs to be running the Pimoroni micropython https://github.com/pimoroni/pimoroni-pico-rp2350/releases or have the pico display pack libraries installed on vanilla micropython.   
-2. Update the WiFi and Home Assistant configuration in main.py
+1. Copy main.py and the LICENCE.txt file to your Pico W which needs to be running the Pimoroni micropython https://github.com/pimoroni/pimoroni-pico-rp2350/releases or have the pico display pack libraries installed on vanilla micropython.   
+2. Update the WiFi and Home Assistant configuration near the top of main.py
 3. Ensure Home Assistant has the Sonos integration installed and properly configured
 4. Reset the Pico W to start the application
 
 ## Usage
 
-- Button A: Play/Pause
-- Button B: Menu
+- Button A: Play/Pause or Menu Select
+- Button B: Menu or Back
 - Button X: Volume Up / Menu Up
 - Button Y: Volume Down / Menu Down
 
