@@ -20,7 +20,7 @@ A MicroPython application for controlling Sonos speakers via Home Assistant usin
 ![Main Playback](screenshots/main.jpeg)
 
 ### Menu
-![Menu](screenshots/menu.jpg)
+![Menu](screenshots/menu.jpeg)
 
 ### Speaker Selection
 ![Speaker Selection](screenshots/speakers.jpeg)
