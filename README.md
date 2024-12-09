@@ -42,8 +42,8 @@ A MicroPython application for controlling Sonos speakers via Home Assistant usin
 
 ## Usage
 
-- Button A: Play/Pause or Menu Select
-- Button B: Menu or Back
+- Button A: Short press: Play/Pause (or Select in menu), Long press: Next Track
+- Button B: Short press: Menu/Back, Long press: Previous Track
 - Button X: Volume Up / Menu Up
 - Button Y: Volume Down / Menu Down
 

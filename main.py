@@ -1,7 +1,7 @@
 # Home Assistant Sonos Display Controller / Remote - Raspberry Pi Pico 2 W
 # Copyright 2024 Tim Hanley - see LICENCE.txt for details
 # https://github.com/timhanley/ha-sonos-pico2w-pimoronidisplay
-# v1.0
+# v1.1
 
 
 import gc  # Add garbage collector
@@ -48,8 +48,8 @@ GRAY = display.create_pen(128, 128, 128)
 WIFI_RETRY_DELAY = 10  # seconds between WiFi reconnection attempts
 HA_RETRY_DELAY = 5     # seconds between HA reconnection attempts
 MAX_WIFI_RETRIES = 3   # maximum number of WiFi connection attempts
-BUTTON_DEBOUNCE_TIME = 0.1  # 0.1 seconds between button presses
-BUTTON_FEEDBACK_TIME = 0.5  # How long to show button press feedback in seconds
+BUTTON_DEBOUNCE_TIME = 0.05  # 0.05 seconds between button presses
+BUTTON_FEEDBACK_TIME = 0.2  # How long to show button press feedback in seconds
 last_wifi_check = 0
 wifi_check_interval = 30
 
@@ -99,7 +99,7 @@ current_album_name = None  # Track current album name
 
 # state constants
 last_state_update = 0
-state_update_interval = 1
+state_update_interval = 0.2  # Reduce from 1 to 0.2 seconds for snappier updates
 
 # Speaker constants
 available_speakers = []
@@ -118,6 +118,11 @@ in_brightness_screen = False
 
 # Display constants
 PADDING = 20  # Padding for text from screen edges
+
+# Add to the constants section around line 51
+LONG_PRESS_TIME = 0.6  # Reduce from 0.8 to 0.6 seconds to make it easier to control
+button_a_press_start = 0  # Track when button A was first pressed
+button_b_press_start = 0  # Track when button B was first pressed
 
 def collect_garbage():
     gc.collect()
@@ -233,7 +238,7 @@ def draw_button_labels(force_update=False):
     # Draw button circles with feedback
     button_positions = [
         ("A", a_active, 30),
-        ("B", b_active, 120),
+        ("B", b_active, 145),  # Moved B button further right from 135
         ("X", x_active, WIDTH-90),
         ("Y", y_active, WIDTH-35)
     ]
@@ -251,15 +256,15 @@ def draw_button_labels(force_update=False):
     # Draw function labels
     if in_menu:
         display.text("Select", 45, HEIGHT-22, scale=1)
-        display.text("Back", 135, HEIGHT-22, scale=1)
+        display.text("Back", 160, HEIGHT-22, scale=1)  # Moved label right from 150
         display.text("Up", WIDTH-75, HEIGHT-22, scale=1)
         display.text("Down", WIDTH-25, HEIGHT-22, scale=1)
     else:
-        display.text("Play/Pause", 45, HEIGHT-22, scale=1)
-        display.text("Menu", 135, HEIGHT-22, scale=1)
+        display.text("Play/Pause > Next", 45, HEIGHT-22, scale=1)
+        display.text("Menu < Prev", 160, HEIGHT-22, scale=1)  # Moved label right from 150
         display.text("Vol+", WIDTH-75, HEIGHT-22, scale=1)
         display.text("Vol-", WIDTH-25, HEIGHT-22, scale=1)
-    
+
     if force_update:
         display.update()
 
@@ -997,7 +1002,46 @@ def handle_brightness_control(button_pressed):
         draw_menu()  # Return to menu instead of main screen
 
 def main():
-    global current_speaker, in_speaker_select
+    global current_speaker, in_speaker_select, is_sleeping, album_art_response
+    global last_button_a_press, last_button_x_press, last_button_y_press
+    global button_a_pressed_time, button_x_pressed_time, button_y_pressed_time
+    global current_menu_index, in_menu, last_activity_time
+    global current_state_data, last_state_update, last_wifi_check
+    global button_b_pressed_time, album_art_loading, album_art_state
+    global current_album_art, current_album_art_url
+    global state_data, in_brightness_screen, button_a_press_start
+    global button_b_press_start
+
+    # Initialize all global variables
+    current_speaker = None
+    in_speaker_select = False
+    is_sleeping = False
+    album_art_response = None
+    current_menu_index = 0
+    in_menu = False
+    in_brightness_screen = False
+    album_art_loading = False
+    album_art_state = ALBUM_ART_IDLE
+    current_album_art = None
+    current_album_art_url = None
+    state_data = None
+    current_state_data = None
+    button_a_press_start = 0  # Add initialization for long press tracking
+    button_b_press_start = 0
+
+    # Initialize timing variables with current time
+    current_time = time.time()
+    last_button_a_press = current_time
+    last_button_x_press = current_time
+    last_button_y_press = current_time
+    button_a_pressed_time = current_time
+    button_x_pressed_time = current_time
+    button_y_pressed_time = current_time
+    button_b_pressed_time = current_time
+    last_activity_time = current_time
+    last_state_update = current_time
+    last_wifi_check = current_time
+
     # Check initial WiFi status and set LED accordingly
     wlan = network.WLAN(network.STA_IF)
     if wlan.isconnected():
@@ -1037,44 +1081,6 @@ def main():
             handle_speaker_select('Y')
             time.sleep(0.2)
         time.sleep(0.01)
-    
-    global last_button_a_press, last_button_x_press, last_button_y_press
-    global button_a_pressed_time, button_x_pressed_time, button_y_pressed_time
-    global current_menu_index, in_menu, last_activity_time
-    global current_state_data, last_state_update, last_wifi_check
-    global button_b_pressed_time, album_art_loading, album_art_state
-    global current_album_art, current_album_art_url
-    global state_data, in_brightness_screen
-    
-    # Initialize all timing variables
-    current_time = time.time()
-    last_button_a_press = current_time
-    last_button_x_press = current_time
-    last_button_y_press = current_time
-    button_a_pressed_time = current_time
-    button_x_pressed_time = current_time
-    button_y_pressed_time = current_time
-    button_b_pressed_time = current_time
-    last_activity_time = current_time
-    last_state_update = current_time
-    last_wifi_check = current_time
-    
-    # Initialize state variables
-    state_data = None
-    current_state_data = None
-    
-    # Initialize album art variables
-    album_art_loading = False
-    album_art_state = ALBUM_ART_IDLE
-    current_album_art = None
-    current_album_art_url = None
-    current_album_name = None
-    
-    # Load saved brightness
-    display.set_backlight(load_brightness())
-    
-    # Remove initial state fetch and draw
-    # Let the main loop handle it
     
     try:
         while True:
@@ -1121,29 +1127,52 @@ def main():
                 last_wifi_check = current_time
             
             # Handle button presses
-            if button_b.value() == 0:  # Menu
+            if button_b.value() == 0:  # Menu/Previous
                 update_activity()
-                button_b_pressed_time = current_time
-                if not in_menu and not in_speaker_select:
-                    in_menu = True
-                    current_menu_index = 0
-                    draw_menu()
-                elif in_speaker_select:
-                    in_speaker_select = False
-                    draw_menu()
-                elif in_brightness_screen:
-                    in_brightness_screen = False
-                    draw_menu()
-                else:
-                    in_menu = False
-                    new_state = get_sonos_state()
-                    if new_state:
-                        current_state_data = new_state
-                        draw_screen(current_state_data)
-                time.sleep(0.2)
+                if not in_menu and not in_speaker_select and not in_brightness_screen:
+                    # In main screen - handle long press for previous track
+                    if button_b_press_start == 0:  # Button just pressed
+                        button_b_press_start = current_time
+                        button_b_pressed_time = current_time  # Set initial press time
+                        draw_button_labels(True)  # Show feedback immediately
+                    elif current_time - button_b_press_start >= LONG_PRESS_TIME and button_b_press_start > 0:
+                        # Long press detected - previous track (only trigger once)
+                        button_b_press_start = -1  # Set to -1 to prevent menu on release and prevent multiple triggers
+                        button_b_pressed_time = current_time  # Keep feedback active
+                        if call_ha_service("media_previous_track", {"entity_id": current_speaker}):
+                            time.sleep(0.05)
+                        draw_button_labels(True)
+                elif button_b_press_start == 0:  # First press in menu/other screens
+                    button_b_press_start = current_time
+                    button_b_pressed_time = current_time  # Set initial press time
+                    draw_button_labels(True)  # Show feedback immediately
+                time.sleep(0.1)
+            elif button_b.value() == 1 and button_b_press_start != 0:  # Button released and was pressed
+                if button_b_press_start > 0:  # Was a short press
+                    if not in_menu and not in_speaker_select:
+                        button_b_pressed_time = current_time  # Set feedback for transition
+                        draw_button_labels(True)  # Show feedback before transition
+                        time.sleep(BUTTON_FEEDBACK_TIME)  # Wait for feedback to show
+                        in_menu = True
+                        current_menu_index = 0
+                        button_b_pressed_time = 0  # Clear feedback before drawing menu
+                        draw_menu()
+                    elif in_speaker_select:
+                        in_speaker_select = False
+                        draw_menu()
+                    elif in_brightness_screen:
+                        in_brightness_screen = False
+                        draw_menu()
+                    else:
+                        in_menu = False
+                        new_state = get_sonos_state()
+                        if new_state:
+                            current_state_data = new_state
+                            draw_screen(new_state)
+                button_b_press_start = 0  # Reset press start in all cases
             
             # Handle other buttons based on current screen
-            elif in_speaker_select:
+            if in_speaker_select:
                 if button_a.value() == 0:  # Select
                     update_activity()
                     handle_speaker_select('A')
@@ -1178,25 +1207,45 @@ def main():
                     update_activity()
                     handle_menu_navigation('Y')
                     time.sleep(0.2)
-            else:  # Normal playback controls
-                if button_a.value() == 0:  # Play/Pause
+            else:  # Main playback screen
+                if button_a.value() == 0:  # Play/Pause or Next Track
                     update_activity()
-                    button_a_pressed_time = current_time
-                    draw_button_labels(True)
-                    if call_ha_service("media_play_pause", {"entity_id": current_speaker}):
-                        time.sleep(0.1)
+                    if button_a_press_start == 0:  # Button just pressed
+                        button_a_press_start = current_time
+                        button_a_pressed_time = current_time  # Set initial press time
+                        draw_button_labels(True)
+                    elif current_time - button_a_press_start >= LONG_PRESS_TIME and button_a_press_start > 0:
+                        # Long press detected - skip track (only trigger once)
+                        button_a_press_start = -1  # Set to -1 to prevent play/pause on release
+                        button_a_pressed_time = current_time
+                        draw_button_labels(True)
+                        if call_ha_service("media_next_track", {"entity_id": current_speaker}):
+                            time.sleep(0.05)
+                    time.sleep(0.1)
+                elif button_a.value() == 1:  # Button released
+                    if button_a_press_start > 0:  # Was a short press
+                        # Short press - play/pause
+                        button_a_pressed_time = current_time
+                        draw_button_labels(True)
+                        if call_ha_service("media_play_pause", {"entity_id": current_speaker}):
+                            time.sleep(0.05)
+                    button_a_press_start = 0  # Reset press start in all cases
+                elif button_a_press_start == -1:  # Button released after long press
+                    button_a_press_start = 0  # Just reset the press start
+                
                 if button_x.value() == 0:  # Volume Up
                     update_activity()
                     button_x_pressed_time = current_time
                     draw_button_labels(True)
                     if call_ha_service("volume_up", {"entity_id": current_speaker}):
-                        time.sleep(0.1)
+                        time.sleep(0.05)
+                
                 if button_y.value() == 0:  # Volume Down
                     update_activity()
                     button_y_pressed_time = current_time
                     draw_button_labels(True)
                     if call_ha_service("volume_down", {"entity_id": current_speaker}):
-                        time.sleep(0.1)
+                        time.sleep(0.05)
             
             time.sleep(0.005)  # Main loop sleep 0.005
     finally:
