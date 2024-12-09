@@ -9,6 +9,7 @@ A MicroPython application for controlling Sonos speakers via Home Assistant usin
 - WiFi connectivity status
 - Speaker selection
 - Play/Pause control
+- Skip forward and back control
 - Volume control
 - Album art display
 - Brightness control
