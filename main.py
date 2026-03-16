@@ -21,11 +21,8 @@ except ImportError:
     upip.install('jpegdec')
     import jpegdec
 
-# WiFi and Home Assistant Configuration
-#WIFI_SSID = "YOUR_WIFI_SSD"
-#WIFI_PASSWORD = "YOUR_WIFI_PASSWORD"
-#HA_URL = "http://YOUR_HOME_ASSISTANT_IP ADDRESS:8123"
-#HA_TOKEN = "YOUR_HOME_ASSISTANT_LONG_LIVED_TOKEN"
+# WiFi and Home Assistant Configuration — see config_example.py
+from config import WIFI_SSID, WIFI_PASSWORD, HA_URL, HA_TOKEN
 
 # Initialize display
 display = PicoGraphics(display=DISPLAY_PICO_DISPLAY_2, pen_type=PEN_RGB565)
@@ -1121,8 +1118,8 @@ def main():
             ):
                 process_album_art(20, 60)
             
-            # Normal screen updates when awake
-            if current_time - last_state_update >= state_update_interval:
+            # Normal screen updates when awake — skip if button A is pressed to keep it responsive
+            if current_time - last_state_update >= state_update_interval and button_a.value() == 1:
                 if not in_menu and not in_speaker_select and not in_brightness_screen:
                     new_state = get_sonos_state()
                     if new_state:
@@ -1137,8 +1134,9 @@ def main():
                 check_wifi_connection()
                 last_wifi_check = current_time
             
-            # Add before button handling section
-            collect_garbage()  # Free up memory before processing buttons
+            # Add before button handling section — skip GC if button A is active to keep it responsive
+            if button_a.value() == 1:
+                collect_garbage()  # Free up memory before processing buttons
             
             # Handle button presses
             if button_b.value() == 0:  # Menu/Previous
