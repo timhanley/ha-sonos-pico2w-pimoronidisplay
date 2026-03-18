@@ -367,7 +367,7 @@ async def get_available_speakers_async():
 # ---------------------------------------------------------------------------
 
 async def album_art_task(url, x, y):
-    """Async task: download and decode album art."""
+    """Async task: download and decode album art, then immediately update display."""
     global album_art_state, current_album_art, current_album_art_url, album_art_url
     album_art_state = ALBUM_ART_DOWNLOADING
     try:
@@ -378,8 +378,14 @@ async def album_art_task(url, x, y):
             pass
         status = await async_request_to_file(url, get_ha_headers(), 'album_art.jpg')
         if status == 200:
-            jpeg.open_file('album_art.jpg')
-            jpeg.decode(x, y, jpegdec.JPEG_SCALE_EIGHTH)
+            display_lock.acquire()
+            try:
+                jpeg.open_file('album_art.jpg')
+                jpeg.decode(x, y, jpegdec.JPEG_SCALE_EIGHTH)
+                draw_button_labels()
+                display.update()
+            finally:
+                display_lock.release()
             current_album_art = (x, y, jpegdec.JPEG_SCALE_EIGHTH)
             current_album_art_url = url
             album_art_state = ALBUM_ART_READY
@@ -581,10 +587,10 @@ def draw_screen(state_data):
 
                 # If we have a new URL, start the download as an async task
                 if album_art_url:
-                    asyncio.create_task(album_art_task(album_art_url, 20, 60))
+                    asyncio.create_task(album_art_task(album_art_url, 20, 40))
             elif album_art_state == ALBUM_ART_IDLE and album_art_url and not current_album_art:
                 # No album change but we need to load art
-                asyncio.create_task(album_art_task(album_art_url, 20, 60))
+                asyncio.create_task(album_art_task(album_art_url, 20, 40))
 
         # Draw placeholder or current album art
         if album_art_state == ALBUM_ART_DOWNLOADING:
@@ -643,6 +649,131 @@ def draw_screen(state_data):
     except Exception as e:
         print(f"Critical error in draw_screen: {e}")
         print(f"Error occurred at line: {e.__traceback__.tb_lineno}")
+
+    finally:
+        display_lock.release()
+
+def draw_screen_smart(state_data, old_visible, new_visible):
+    """Zone-based redraw: only repaint changed regions without display.clear().
+    Preserves unchanged zones (e.g. album art) in the framebuffer between updates."""
+    global current_state_data, album_art_state, current_album_art_url
+    global current_album_name, current_album_art
+
+    display_lock.acquire()
+    try:
+        if state_data is None:
+            return
+
+        current_state_data = state_data
+
+        # Fall back to full clear for connectivity errors
+        if not wifi_connected:
+            display.set_pen(BLACK)
+            display.clear()
+            display.set_pen(WHITE)
+            display.text("WiFi Disconnected", WIDTH//2 - 60, HEIGHT//2, scale=2)
+            draw_button_labels()
+            display.update()
+            return
+        elif not ha_connected:
+            display.set_pen(BLACK)
+            display.clear()
+            display.set_pen(WHITE)
+            display.text("Home Assistant", WIDTH//2 - 60, HEIGHT//2 - 20, scale=2)
+            display.text("Unavailable", WIDTH//2 - 40, HEIGHT//2 + 10, scale=2)
+            draw_button_labels()
+            display.update()
+            return
+
+        char_width = 8
+        text_start = 110
+        available_width = WIDTH - text_start - 20
+        chars_per_line = available_width // char_width
+
+        # Status zone: state[0] or friendly_name[5] changed
+        if new_visible[0] != old_visible[0] or new_visible[5] != old_visible[5]:
+            display.set_pen(BLACK)
+            display.rectangle(3, 3, WIDTH-6, 33)
+            state = state_data.get('state', 'unknown')
+            if isinstance(state, str):
+                state = state[0].upper() + state[1:].lower()
+            else:
+                state = "Unknown"
+            speaker_name = state_data.get('attributes', {}).get('friendly_name', '')
+            display.set_pen(GRAY)
+            display.text(f"{state} - {speaker_name}", 20, 10, scale=2)
+
+        # Text zone: media_artist[1] or media_title[2] changed
+        if new_visible[1] != old_visible[1] or new_visible[2] != old_visible[2]:
+            display.set_pen(BLACK)
+            display.rectangle(110, 38, WIDTH-112, 123)
+            display.set_pen(WHITE)
+
+            artist = state_data['attributes'].get('media_artist', 'Unknown Artist')
+            display.text("Artist:", 110, 40, scale=1)
+            if len(artist) > chars_per_line:
+                space_pos = artist[:chars_per_line].rfind(' ')
+                if space_pos > 0:
+                    display.text(artist[:space_pos], text_start, 55, scale=2)
+                    display.text(artist[space_pos + 1:], text_start, 75, scale=2)
+                else:
+                    display.text(artist[:chars_per_line], text_start, 55, scale=2)
+                    display.text(artist[chars_per_line:], text_start, 75, scale=2)
+            else:
+                display.text(artist, text_start, 55, scale=2)
+
+            title = state_data['attributes'].get('media_title', 'Unknown Track')
+            display.text("Title:", 110, 95, scale=1)
+            if len(title) > chars_per_line:
+                space_pos = title[:chars_per_line].rfind(' ')
+                if space_pos > 0:
+                    display.text(title[:space_pos], text_start, 110, scale=2)
+                    display.text(title[space_pos + 1:], text_start, 130, scale=2)
+                else:
+                    display.text(title[:chars_per_line], text_start, 110, scale=2)
+                    display.text(title[chars_per_line:], text_start, 130, scale=2)
+            else:
+                display.text(title, text_start, 110, scale=2)
+
+        # Album art zone: media_album_name[3] changed
+        if new_visible[3] != old_visible[3]:
+            new_album_name = state_data['attributes'].get('media_album_name')
+            album_art_url = get_album_art(state_data)
+            if new_album_name != current_album_name:
+                current_album_art = None
+                current_album_art_url = None
+                album_art_state = ALBUM_ART_IDLE
+                current_album_name = new_album_name
+                # Show loading placeholder
+                display.set_pen(GRAY)
+                display.rectangle(20, 40, 80, 80)
+                display.set_pen(WHITE)
+                text = "Loading..."
+                display.text(text, 20 + (80 - len(text)*6)//2 + 2, 40 + (80-8)//2, scale=1)
+                if album_art_url:
+                    asyncio.create_task(album_art_task(album_art_url, 20, 40))
+            elif album_art_state == ALBUM_ART_IDLE and album_art_url and not current_album_art:
+                asyncio.create_task(album_art_task(album_art_url, 20, 40))
+
+        # Volume zone: volume_level[4] changed
+        if new_visible[4] != old_visible[4]:
+            display.set_pen(BLACK)
+            display.rectangle(3, 161, WIDTH-6, 32)
+            volume = state_data['attributes'].get('volume_level', 0)
+            display.set_pen(WHITE)
+            display.text(f"Volume: {int(volume * 100)}%", WIDTH//2 - 35, 167, scale=1)
+            display.set_pen(GRAY)
+            display.rectangle(20, 182, WIDTH-40, 10)
+            display.set_pen(WHITE)
+            display.rectangle(20, 182, int((WIDTH-40) * volume), 10)
+
+        # Always redraw button labels and push frame
+        draw_button_labels()
+        display.update()
+        collect_garbage()
+
+    except Exception as e:
+        print(f"Error in draw_screen_smart: {e}")
 
     finally:
         display_lock.release()
@@ -1203,17 +1334,30 @@ def visible_state(state_data):
 
 async def state_poll_task():
     global last_state_update, current_state_data
+    prev_visible = None
     while True:
         await asyncio.sleep(state_update_interval)
-        if not is_sleeping and not in_menu and not in_speaker_select and not in_brightness_screen:
-            new_state = await get_sonos_state_async()
-            if new_state:
-                if visible_state(new_state) != visible_state(current_state_data):
-                    current_state_data = new_state
-                    draw_screen(current_state_data)
-                else:
-                    current_state_data = new_state  # keep state fresh without redrawing
-            last_state_update = time.time()
+        # Not on main screen — reset so next entry gets a full redraw
+        if is_sleeping or in_menu or in_speaker_select or in_brightness_screen:
+            prev_visible = None
+            continue
+        new_state = await get_sonos_state_async()
+        if new_state:
+            new_visible = visible_state(new_state)
+            old_visible = visible_state(current_state_data)
+            if prev_visible is None:
+                # First draw after entering main screen — full redraw
+                current_state_data = new_state
+                draw_screen(current_state_data)
+                prev_visible = new_visible
+            elif new_visible != old_visible:
+                # Something visible changed — zone-based update
+                current_state_data = new_state
+                draw_screen_smart(current_state_data, prev_visible, new_visible)
+                prev_visible = new_visible
+            else:
+                current_state_data = new_state  # keep state fresh, no redraw
+        last_state_update = time.time()
 
 
 async def wifi_check_task():
