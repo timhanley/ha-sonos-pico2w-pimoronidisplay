@@ -6,7 +6,7 @@
 
 import gc  # Add garbage collector
 import network
-import urequests
+import asyncio
 import json
 import time
 import _thread
@@ -97,7 +97,7 @@ current_album_name = None  # Track current album name
 
 # state constants
 last_state_update = 0
-state_update_interval = 0.2  # Reduce from 1 to 0.2 seconds for snappier updates
+state_update_interval = 1.0  # Poll interval for state_poll_task
 
 # Speaker constants
 available_speakers = []
@@ -151,104 +151,248 @@ def get_ha_headers():
         "Content-Type": "application/json",
     }
 
-def get_sonos_state():
+# ---------------------------------------------------------------------------
+# Async HTTP helpers
+# ---------------------------------------------------------------------------
+
+async def async_request(method, url, headers=None, json_data=None):
+    """Async HTTP request. Returns (status_code, parsed_json_or_None)."""
+    collect_garbage()
+    url_no_proto = url[7:]  # strip 'http://'
+    slash_pos = url_no_proto.find('/')
+    if slash_pos == -1:
+        host_port, path = url_no_proto, '/'
+    else:
+        host_port, path = url_no_proto[:slash_pos], url_no_proto[slash_pos:]
+    host, port = (host_port.rsplit(':', 1)[0], int(host_port.rsplit(':', 1)[1])) if ':' in host_port else (host_port, 80)
+
+    body_bytes = json.dumps(json_data).encode() if json_data is not None else b''
+    req = f'{method} {path} HTTP/1.0\r\nHost: {host}:{port}\r\n'
+    if headers:
+        req += ''.join(f'{k}: {v}\r\n' for k, v in headers.items())
+    if body_bytes:
+        req += f'Content-Length: {len(body_bytes)}\r\n'
+    req += '\r\n'
+
+    reader, writer = await asyncio.open_connection(host, port)
+    writer.write(req.encode() + body_bytes)
+    await writer.drain()
+
+    response = b''
+    while True:
+        chunk = await reader.read(512)
+        if not chunk:
+            break
+        response += chunk
+    writer.close()
+    collect_garbage()
+
+    header_end = response.find(b'\r\n\r\n')
+    if header_end == -1:
+        return None, None
+    status_code = int(response[:response.find(b'\r\n')].decode().split(' ')[1])
+    try:
+        return status_code, json.loads(response[header_end + 4:])
+    except:
+        return status_code, None
+
+
+async def async_request_to_file(url, headers, filename):
+    """Async HTTP GET, streams response body to file. Returns status_code."""
+    collect_garbage()
+    url_no_proto = url[7:]
+    slash_pos = url_no_proto.find('/')
+    if slash_pos == -1:
+        host_port, path = url_no_proto, '/'
+    else:
+        host_port, path = url_no_proto[:slash_pos], url_no_proto[slash_pos:]
+    host, port = (host_port.rsplit(':', 1)[0], int(host_port.rsplit(':', 1)[1])) if ':' in host_port else (host_port, 80)
+
+    req = f'GET {path} HTTP/1.0\r\nHost: {host}:{port}\r\n'
+    if headers:
+        req += ''.join(f'{k}: {v}\r\n' for k, v in headers.items())
+    req += '\r\n'
+
+    reader, writer = await asyncio.open_connection(host, port)
+    writer.write(req.encode())
+    await writer.drain()
+
+    # Read status line
+    status_line = await reader.readline()
+    status_code = int(status_line.decode().split(' ')[1])
+
+    # Skip remaining headers
+    while True:
+        line = await reader.readline()
+        if line in (b'\r\n', b'', b'\n'):
+            break
+
+    with open(filename, 'wb') as f:
+        while True:
+            chunk = await reader.read(4096)
+            if not chunk:
+                break
+            f.write(chunk)
+            await asyncio.sleep(0)
+
+    writer.close()
+    collect_garbage()
+    return status_code
+
+# ---------------------------------------------------------------------------
+# Async HA functions
+# ---------------------------------------------------------------------------
+
+async def get_sonos_state_async():
     global ha_connected
     if not check_wifi_connection() or not current_speaker:
         return None
-        
     try:
-        collect_garbage()
-        response = urequests.get(
-            f"{HA_URL}/api/states/{current_speaker}",
-            headers=get_ha_headers()
-        )
-        data = response.json()
-        response.close()
-        ha_connected = True
-        return data
-    except Exception as e:
+        status, data = await async_request('GET', f'{HA_URL}/api/states/{current_speaker}', get_ha_headers())
+        if status == 200:
+            ha_connected = True
+            return data
         ha_connected = False
         return None
-    finally:
-        collect_garbage()
+    except:
+        ha_connected = False
+        return None
 
-def call_ha_service(service, data):
+
+async def call_ha_service_async(service, data):
     global ha_connected
     if not check_wifi_connection():
         return False
-        
-    retries = 3
-    while retries > 0:
+    for attempt in range(2):
         try:
-            collect_garbage()
-            response = urequests.post(
-                f"{HA_URL}/api/services/media_player/{service}",
-                headers=get_ha_headers(),
-                json=data
-            )
-            
-            if response.status_code == 200:
-                response.close()
+            status, _ = await async_request('POST', f'{HA_URL}/api/services/media_player/{service}', get_ha_headers(), data)
+            if status == 200:
                 ha_connected = True
                 return True
-            else:
-                response.close()
-                # Show error on screen
-                display.set_pen(BLACK)
-                display.clear()
-                
-                # Draw centered text
-                display.set_pen(WHITE)
-                error_text = "HA Connection Error"
-                text_width = len(error_text) * 8  # Assuming 8 pixels per character
-                text_x = (WIDTH - text_width) // 2
-                text_y = HEIGHT // 2  # Center vertically
-                display.text(error_text, text_x, text_y, scale=1)
-                safe_display_update()
-                time.sleep(1)
-
-            retries -= 1
-            if retries > 0:
-                time.sleep(1)
-
-        except Exception as e:
-            # Show error on screen
             display.set_pen(BLACK)
             display.clear()
-
-            # Draw centered text
             display.set_pen(WHITE)
             error_text = "HA Connection Error"
-            text_width = len(error_text) * 8  # Assuming 8 pixels per character
-            text_x = (WIDTH - text_width) // 2
-            text_y = HEIGHT // 2  # Center vertically
-            display.text(error_text, text_x, text_y, scale=1)
+            display.text(error_text, (WIDTH - len(error_text) * 8) // 2, HEIGHT // 2, scale=1)
             safe_display_update()
-            time.sleep(1)
-            
-            retries -= 1
-            if retries > 0:
-                time.sleep(1)
-        finally:
-            collect_garbage()
-    
+        except:
+            display.set_pen(BLACK)
+            display.clear()
+            display.set_pen(WHITE)
+            error_text = "HA Connection Error"
+            display.text(error_text, (WIDTH - len(error_text) * 8) // 2, HEIGHT // 2, scale=1)
+            safe_display_update()
+        if attempt == 0:
+            await asyncio.sleep(0.5)
     ha_connected = False
     return False
+
+
+async def get_available_speakers_async():
+    global available_speakers
+    show_loading_screen("Loading Speakers...")
+    if not check_wifi_connection():
+        show_loading_screen("WiFi Not Connected")
+        await asyncio.sleep(2)
+        return False
+    try:
+        # Ping HA first
+        status, _ = await async_request('GET', f'{HA_URL}/api', get_ha_headers())
+        if status is None:
+            raise Exception("Cannot reach HA")
+    except:
+        display.set_pen(BLACK)
+        display.clear()
+        display.set_pen(WHITE)
+        error_text = "Cannot Reach Home Assistant"
+        display.text(error_text, (WIDTH - len(error_text) * 9) // 2, HEIGHT // 2, scale=2)
+        safe_display_update()
+        await asyncio.sleep(2)
+        return False
+    try:
+        template = """
+            {% set devices = states | map(attribute='entity_id') | map('device_id') | unique | reject('eq', None) | list %}
+            {%- set ns = namespace(sonos_devices=[]) %}
+            {%- for device in devices %}
+                {%- if 'sonos' in device_attr(device, 'identifiers') | join %}
+                    {%- set entities = device_entities(device) | list %}
+                    {%- set ns.sonos_devices = ns.sonos_devices + [{'device_id': device, 'device_name': device_attr(device, 'name'), 'entities': entities}] %}
+                {%- endif %}
+            {%- endfor %}
+            {{ ns.sonos_devices | tojson }}
+        """
+        status, result = await async_request('POST', f'{HA_URL}/api/template', get_ha_headers(), {"template": template})
+        if status != 200 or result is None:
+            raise Exception("Template API failed")
+        collect_garbage()
+        speakers = []
+        for device in result:
+            for entity in device['entities']:
+                if entity.startswith('media_player.'):
+                    speakers.append({'entity_id': entity, 'name': device['device_name']})
+                    print(f"Found speaker: {device['device_name']} ({entity})")
+                    break
+        if speakers:
+            available_speakers = speakers
+            print(f"Total Sonos speakers found: {len(speakers)}")
+            return True
+        print("No Sonos speakers found")
+        show_loading_screen("No Sonos\nSpeakers Found")
+        await asyncio.sleep(2)
+        return False
+    except Exception as e:
+        print(f"Error fetching speakers: {e}")
+        show_loading_screen("Error Loading\nSpeakers\n" + str(e))
+        await asyncio.sleep(2)
+        return False
+    finally:
+        collect_garbage()
+
+# ---------------------------------------------------------------------------
+# Album art — async task
+# ---------------------------------------------------------------------------
+
+async def album_art_task(url, x, y):
+    """Async task: download and decode album art."""
+    global album_art_state, current_album_art, current_album_art_url, album_art_url
+    album_art_state = ALBUM_ART_DOWNLOADING
+    try:
+        import os
+        try:
+            os.remove('album_art.jpg')
+        except:
+            pass
+        status = await async_request_to_file(url, get_ha_headers(), 'album_art.jpg')
+        if status == 200:
+            jpeg.open_file('album_art.jpg')
+            jpeg.decode(x, y, jpegdec.JPEG_SCALE_EIGHTH)
+            current_album_art = (x, y, jpegdec.JPEG_SCALE_EIGHTH)
+            current_album_art_url = url
+            album_art_state = ALBUM_ART_READY
+        else:
+            album_art_state = ALBUM_ART_IDLE
+    except Exception as e:
+        print(f"Error downloading album art: {e}")
+        album_art_state = ALBUM_ART_IDLE
+
+# ---------------------------------------------------------------------------
+# Drawing helpers (unchanged)
+# ---------------------------------------------------------------------------
 
 def draw_button_labels(force_update=False):
     """Draw button labels with press feedback"""
     current_time = time.time()
-    
+
     # Clear button areas
     display.set_pen(BLACK)
     display.rectangle(0, HEIGHT-40, WIDTH, 40)  # Bottom area for buttons
-    
+
     # Check if buttons are currently pressed or recently pressed
     a_active = (current_time - button_a_pressed_time) < BUTTON_FEEDBACK_TIME
     b_active = (current_time - button_b_pressed_time) < BUTTON_FEEDBACK_TIME
     x_active = (current_time - button_x_pressed_time) < BUTTON_FEEDBACK_TIME
     y_active = (current_time - button_y_pressed_time) < BUTTON_FEEDBACK_TIME
-    
+
     # Create pens for button feedback
     GREEN = display.create_pen(0, 128, 0)
     BLUE = display.create_pen(0, 64, 192)
@@ -274,11 +418,11 @@ def draw_button_labels(force_update=False):
         else:
             display.set_pen(GRAY)
         display.circle(x_pos, HEIGHT-20, 7)
-        
+
         # Center the letter in the circle
         display.set_pen(WHITE)
         display.text(button, x_pos-3, HEIGHT-22, scale=1)
-    
+
     display.set_pen(WHITE)
     # Draw function labels
     if in_menu:
@@ -299,17 +443,17 @@ def draw_screen(state_data):
     """Draw the main screen with the provided state data"""
     global album_art_loading, current_state_data, album_art_state, current_album_art_url
     global current_album_name, current_album_art
-    
+
     try:
         if state_data is None:
             return
-            
+
         current_state_data = state_data
         collect_garbage()
-        
+
         display.set_pen(BLACK)
         display.clear()
-        
+
         if not wifi_connected:
             display.set_pen(WHITE)
             display.text("WiFi Disconnected", WIDTH//2 - 60, HEIGHT//2, scale=2)
@@ -323,23 +467,23 @@ def draw_screen(state_data):
             draw_button_labels()
             safe_display_update()
             return
-        
+
         # Draw speaker info box
         display.set_pen(GRAY)
         display.rectangle(0, 0, WIDTH, 197)
         display.set_pen(BLACK)
         display.rectangle(2, 2, WIDTH-4, 193)
-        
+
         # Define character width for text calculations
         char_width = 8  # Bitmap8 at scale 2 is exactly 8 pixels per char
-        
+
         # Draw play state with speaker name
         state = state_data.get('state', 'unknown')
         if isinstance(state, str):
             state = state[0].upper() + state[1:].lower()
         else:
             state = "Unknown"
-        
+
         display.set_pen(GRAY)
 
         speaker_name = state_data.get('attributes', {}).get('friendly_name', '')
@@ -347,17 +491,17 @@ def draw_screen(state_data):
 
         # Try centering with smaller offset
         display.text(status_text, 20, 10, scale=2)  # Align with album art x position
-        
+
         # Artist section - with word wrap
         artist = state_data['attributes'].get('media_artist', 'Unknown Artist')
         display.set_pen(WHITE)
         display.text("Artist:", 110, 40, scale=1)
-        
+
         # Calculate available space for text
         text_start = 110  # Starting position for text
         available_width = WIDTH - text_start - 20  # Space between start position and right border
         chars_per_line = available_width // char_width  # How many characters fit in available space
-        
+
         # Split artist if needed
         if len(artist) > chars_per_line:
             # Find last space before limit
@@ -375,17 +519,17 @@ def draw_screen(state_data):
                 display.text(second_line, text_start, 75, scale=2)
         else:
             display.text(artist, text_start, 55, scale=2)
-        
+
         # Title section - with proper wrapping
         title = state_data['attributes'].get('media_title', 'Unknown Track')
         display.text("Title:", 110, 95, scale=1)
-        
+
         # Calculate exact character width and available space for title
         char_width = 8  # Bitmap8 at scale 2 is exactly 8 pixels per char
         text_start = 110  # Starting position for text
         available_width = WIDTH - text_start - 20  # Space between start position and right border
         chars_per_line = available_width // char_width  # How many characters fit in available space
-                
+
         # Split title if needed
         if len(title) > chars_per_line:
             # Find last space before limit
@@ -403,15 +547,15 @@ def draw_screen(state_data):
                 display.text(second_line, text_start, 130, scale=2)
         else:
             display.text(title, text_start, 110, scale=2)
-        
+
         # Album art handling
         if gc.mem_free() > 30000:
-            
+
             # Get new album name and compare with stored name
             new_album_name = state_data['attributes'].get('media_album_name')
             album_art_url = get_album_art(state_data)
-            
-            
+
+
             # Check if album name changed
             if new_album_name != current_album_name:
                 # Clear current art and reset state
@@ -419,14 +563,14 @@ def draw_screen(state_data):
                 current_album_art_url = None
                 album_art_state = ALBUM_ART_IDLE
                 current_album_name = new_album_name  # Update stored album name
-                
-                # If we have a new URL, start the download
+
+                # If we have a new URL, start the download as an async task
                 if album_art_url:
-                    load_album_art(album_art_url, 20, 40)
+                    asyncio.create_task(album_art_task(album_art_url, 20, 60))
             elif album_art_state == ALBUM_ART_IDLE and album_art_url and not current_album_art:
                 # No album change but we need to load art
-                load_album_art(album_art_url, 20, 40)
-        
+                asyncio.create_task(album_art_task(album_art_url, 20, 60))
+
         # Draw placeholder or current album art
         if album_art_state == ALBUM_ART_DOWNLOADING:
             # Draw loading placeholder
@@ -461,20 +605,20 @@ def draw_screen(state_data):
             text_x = 20 + (80 - text_width) // 2 + 2  # Added small offset for fine-tuning
             text_y = 40 + (80 - text_height) // 2
             display.text(text, text_x, text_y, scale=1)
-        
+
         # Keep volume section at current position
         volume = state_data['attributes'].get('volume_level', 0)
         vol_text = f"Volume: {int(volume * 100)}%"
         display.set_pen(WHITE)  # Make sure we're using white for the text
         display.text(vol_text, WIDTH//2 - 35, 167, scale=1)
-        
+
         # Volume bar
         display.set_pen(GRAY)
         display.rectangle(20, 182, WIDTH-40, 10)
         display.set_pen(WHITE)
         vol_width = int((WIDTH-40) * volume)
         display.rectangle(20, 182, vol_width, 10)
-        
+
         # Draw button labels
         draw_button_labels()
 
@@ -491,7 +635,7 @@ def draw_screen(state_data):
 
         safe_display_update()
         collect_garbage()
-        
+
     except Exception as e:
         print(f"Critical error in draw_screen: {e}")
         print(f"Error occurred at line: {e.__traceback__.tb_lineno}")  # Debug line number
@@ -501,11 +645,11 @@ def show_message(message, scale=2):
     display.set_pen(BLACK)
     display.clear()
     display.set_pen(WHITE)
-    
+
     # Calculate center position using 6 pixels per character instead of 8
     x = WIDTH//2 - (len(message) * 6 * scale)//2
     y = HEIGHT//2 - (8 * scale)
-    
+
     display.text(message, x, y, scale=scale)
     safe_display_update()
 
@@ -513,18 +657,18 @@ def connect_wifi():
     global wifi_connected
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
-    
+
     # Set initial LED state to dim red to show no connection
     led.set_rgb(16, 0, 0)  # Dim red at same brightness level
     time.sleep(0.1)  # Brief pause
     led.set_rgb(16, 8, 0)  # Orange/yellow while connecting, but dimmer
-    
+
     # Show connecting message
     show_message("Connecting to WiFi...")
     print("Connecting to WiFi...")
-    
+
     wlan.connect(WIFI_SSID, WIFI_PASSWORD)
-    
+
     # Wait for connection with timeout
     max_wait = 10
     while max_wait > 0:
@@ -533,14 +677,14 @@ def connect_wifi():
         max_wait -= 1
         print("Waiting for WiFi connection...")
         time.sleep(1)
-    
+
     if wlan.status() != 3:
         led.set_rgb(16, 0, 0)  # Red for failed connection, but dimmer
         wifi_connected = False
         show_message("WiFi Connection Failed")
         print("WiFi connection failed")
         return False
-    
+
     led.set_rgb(0, 16, 0)  # Green for connected
     wifi_connected = True
     print("WiFi connected successfully")
@@ -560,21 +704,21 @@ def draw_menu():
     # Clear the entire screen first
     display.set_pen(BLACK)
     display.clear()
-    
+
     # Draw border
     display.set_pen(GRAY)
     display.rectangle(0, 0, WIDTH, 197)
     display.set_pen(BLACK)
     display.rectangle(2, 2, WIDTH-4, 193)
-    
+
     # Draw menu title
     display.set_pen(WHITE)
     display.text("MENU", WIDTH//2 - 20, 20, scale=2)
-    
+
     # Calculate menu item spacing
     menu_start_y = 60  # Start lower to account for title
     menu_spacing = 30  # Increase spacing between items
-    
+
     # Draw menu items
     for i, item in enumerate(MENU_ITEMS):
         if i == current_menu_index:
@@ -583,23 +727,52 @@ def draw_menu():
             display.rectangle(20, menu_start_y + (i * menu_spacing) - 5, WIDTH-40, 25)
         display.set_pen(WHITE)
         display.text(item, 30, menu_start_y + (i * menu_spacing), scale=2)
-    
+
     # Draw button labels
     draw_button_labels()
     safe_display_update()
 
-def handle_menu_navigation(button_pressed):
-    """Handle menu navigation"""
-    global current_menu_index, in_menu, in_speaker_select, current_state_data, in_brightness_screen, button_b_pressed_time  # Add button_b_pressed_time
-    
+# ---------------------------------------------------------------------------
+# Async handler functions
+# ---------------------------------------------------------------------------
+
+async def handle_speaker_select_async(button_pressed):
+    """Handle speaker selection — async variant (used for 'A' which fetches state)."""
+    global current_speaker_index, in_speaker_select, in_menu, current_speaker, current_state_data
+
+    if button_pressed == 'X':  # Up
+        if len(available_speakers) > 0:
+            current_speaker_index = (current_speaker_index - 1) % len(available_speakers)
+            draw_speaker_select()
+    elif button_pressed == 'Y':  # Down
+        if len(available_speakers) > 0:
+            current_speaker_index = (current_speaker_index + 1) % len(available_speakers)
+            draw_speaker_select()
+    elif button_pressed == 'A':  # Select
+        if len(available_speakers) > 0:
+            current_speaker = available_speakers[current_speaker_index]['entity_id']
+            in_speaker_select = False
+            in_menu = False
+            # Return to main screen
+            new_state = await get_sonos_state_async()
+            if new_state:
+                current_state_data = new_state
+                draw_screen(current_state_data)
+    elif button_pressed == 'B':  # Back
+        in_speaker_select = False
+        draw_menu()
+
+
+async def handle_menu_navigation_async(button_pressed):
+    """Handle menu navigation — async variant."""
+    global current_menu_index, in_menu, in_speaker_select, current_state_data, in_brightness_screen, button_b_pressed_time
+
     if button_pressed == 'X' or button_pressed == 'Y':  # Up/Down
         current_menu_index = (current_menu_index - 1 if button_pressed == 'X' else current_menu_index + 1) % len(MENU_ITEMS)
         draw_menu()
     elif button_pressed == 'A':  # Select
         if MENU_ITEMS[current_menu_index] == "Select Speaker":
-            # Show loading screen before fetching speakers
-            show_loading_screen("Loading Speakers...")
-            if get_available_speakers():
+            if await get_available_speakers_async():
                 in_speaker_select = True
                 button_b_pressed_time = 0  # Reset button feedback
                 draw_speaker_select()
@@ -612,17 +785,43 @@ def handle_menu_navigation(button_pressed):
         elif MENU_ITEMS[current_menu_index] == "Exit Menu":
             in_menu = False
             button_b_pressed_time = 0  # Reset button feedback
-            new_state = get_sonos_state()
+            new_state = await get_sonos_state_async()
             if new_state:
                 current_state_data = new_state
                 draw_screen(new_state)
     elif button_pressed == 'B':  # Back
         in_menu = False
         button_b_pressed_time = 0  # Reset button feedback
-        new_state = get_sonos_state()
+        new_state = await get_sonos_state_async()
         if new_state:
             current_state_data = new_state
             draw_screen(new_state)
+
+
+async def wake_device_async():
+    """Wake the device from sleep mode — async variant."""
+    global is_sleeping, last_activity_time, current_state_data, current_album_name
+    is_sleeping = False
+    last_activity_time = time.time()
+    display.set_backlight(current_brightness)  # Use saved brightness
+    led.set_rgb(0, 16, 0)
+
+    # Redraw the appropriate screen
+    if in_speaker_select:
+        draw_speaker_select()
+    elif in_brightness_screen:  # Add brightness screen check
+        draw_brightness_screen()
+    elif in_menu:
+        draw_menu()
+    else:
+        new_state = await get_sonos_state_async()
+        if new_state:
+            current_state_data = new_state
+            draw_screen(new_state)
+
+# ---------------------------------------------------------------------------
+# Unchanged helper functions
+# ---------------------------------------------------------------------------
 
 def pulse_led():
     """Simple blink in sleep mode"""
@@ -632,27 +831,6 @@ def pulse_led():
         led.set_rgb(0, 16, 0)  # Dim green on
     else:
         led.set_rgb(0, 0, 0)   # LED off
-
-def wake_device():
-    """Wake the device from sleep mode"""
-    global is_sleeping, last_activity_time, current_state_data, current_album_name
-    is_sleeping = False
-    last_activity_time = time.time()
-    display.set_backlight(current_brightness)  # Use saved brightness
-    led.set_rgb(0, 16, 0)
-    
-    # Redraw the appropriate screen
-    if in_speaker_select:
-        draw_speaker_select()
-    elif in_brightness_screen:  # Add brightness screen check
-        draw_brightness_screen()
-    elif in_menu:
-        draw_menu()
-    else:
-        new_state = get_sonos_state()
-        if new_state:
-            current_state_data = new_state
-            draw_screen(new_state)
 
 def enter_sleep_mode():
     """Enter low power sleep mode"""
@@ -679,65 +857,6 @@ def get_album_art(state_data):
         return None
     return None
 
-def load_album_art(url, x, y):
-    """Start album art download"""
-    global album_art_state, album_art_response, album_art_url
-    
-    try:
-        # Clean up any existing download
-        if album_art_response:
-            album_art_response.close()
-        
-        # Remove existing art file
-        try:
-            import os
-            os.remove('album_art.jpg')
-        except:
-            pass
-            
-        # Start new download
-        album_art_response = urequests.get(url, stream=True)
-        album_art_url = url
-        album_art_state = ALBUM_ART_DOWNLOADING
-        
-    except Exception as e:
-        print(f"Error loading album art: {e}")
-        album_art_state = ALBUM_ART_IDLE
-
-def process_album_art(x, y):
-    """Process album art download"""
-    global album_art_state, album_art_response, current_album_art, current_album_art_url, album_art_url
-    global current_album_name
-    
-    try:
-        if album_art_response and album_art_state == ALBUM_ART_DOWNLOADING:
-            # Read a larger chunk
-            chunk = album_art_response.raw.read(4096)  # Increased chunk size
-            
-            if chunk:
-                # Append to file if there's data
-                with open('album_art.jpg', 'ab') as f:
-                    f.write(chunk)
-                return  # Exit and continue in next loop iteration
-            else:
-                # No more data - we're done downloading
-                album_art_response.close()
-                album_art_response = None
-                
-                # Decode and display
-                jpeg.open_file('album_art.jpg')
-                jpeg.decode(x, y, jpegdec.JPEG_SCALE_EIGHTH)
-                current_album_art = (x, y, jpegdec.JPEG_SCALE_EIGHTH)
-                current_album_art_url = album_art_url
-                album_art_state = ALBUM_ART_READY
-                
-    except Exception as e:
-        print(f"Error processing album art: {e}")
-        album_art_state = ALBUM_ART_IDLE
-        if album_art_response:
-            album_art_response.close()
-            album_art_response = None
-
 def show_loading_screen(message="Loading..."):
     """Show a loading screen with a message"""
     # Clear the screen and draw border
@@ -747,7 +866,7 @@ def show_loading_screen(message="Loading..."):
     display.rectangle(0, 0, WIDTH, 197)
     display.set_pen(BLACK)
     display.rectangle(2, 2, WIDTH-4, 193)
-    
+
     # Draw message
     display.set_pen(WHITE)
     text_width = len(message) * 12  # Approximate width for scale 2
@@ -755,95 +874,6 @@ def show_loading_screen(message="Loading..."):
     text_y = HEIGHT // 2 - 10
     display.text(message, text_x, text_y, scale=2)
     safe_display_update()
-
-def get_available_speakers():
-    """Fetch all Sonos speakers from Home Assistant using template"""
-    global available_speakers
-    
-    # Show loading screen
-    show_loading_screen("Loading Speakers...")
-    
-    # Check WiFi connection first
-    if not check_wifi_connection():
-        show_loading_screen("WiFi Not Connected")
-        time.sleep(2)
-        return False
-    
-    try:
-        # Try to ping HA first
-        try:
-            response = urequests.get(f"{HA_URL}/api", headers=get_ha_headers())
-            response.close()
-        except Exception as e:
-            print(f"Cannot Reach Home Assistant: {e}")
-            # Show error using same style as other errors
-            display.set_pen(BLACK)
-            display.clear()
-            display.set_pen(WHITE)
-            error_text = "Cannot Reach Home Assistant"
-            text_width = len(error_text) * 9
-            text_x = (WIDTH - text_width) // 2
-            text_y = HEIGHT // 2
-            display.text(error_text, text_x, text_y, scale=2)
-            safe_display_update()
-            time.sleep(2)
-            return False
-
-        # Template to get Sonos devices and their entities
-        template = """
-            {% set devices = states | map(attribute='entity_id') | map('device_id') | unique | reject('eq', None) | list %}
-            {%- set ns = namespace(sonos_devices=[]) %}
-            {%- for device in devices %}
-                {%- if 'sonos' in device_attr(device, 'identifiers') | join %}
-                    {%- set entities = device_entities(device) | list %}
-                    {%- set ns.sonos_devices = ns.sonos_devices + [{'device_id': device, 'device_name': device_attr(device, 'name'), 'entities': entities}] %}
-                {%- endif %}
-            {%- endfor %}
-            {{ ns.sonos_devices | tojson }}
-        """
-        
-        # Make template API request
-        response = urequests.post(
-            f"{HA_URL}/api/template",
-            headers=get_ha_headers(),
-            json={"template": template}
-        )
-        
-        result = response.json()  # Parse JSON response
-        response.close()
-        collect_garbage()
-        
-        # Process results
-        speakers = []
-        for device in result:
-            # Find the media_player entity for this device
-            for entity in device['entities']:
-                if entity.startswith('media_player.'):
-                    speakers.append({
-                        'entity_id': entity,
-                        'name': device['device_name']
-                    })
-                    print(f"Found speaker: {device['device_name']} ({entity})")  # Debug
-                    break  # Only need one media_player entity per device
-        
-        if speakers:
-            available_speakers = speakers
-            print(f"Total Sonos speakers found: {len(speakers)}")  # Debug
-            return True
-        
-        print("No Sonos speakers found")  # Debug
-        show_loading_screen("No Sonos\nSpeakers Found")
-        time.sleep(2)
-        return False
-        
-    except Exception as e:
-        print(f"Error fetching speakers: {e}")
-        print(f"Error type: {type(e)}")
-        show_loading_screen("Error Loading\nSpeakers\n" + str(e))
-        time.sleep(2)
-        return False
-    finally:
-        collect_garbage()
 
 def draw_speaker_select():
     """Draw the speaker selection interface"""
@@ -854,43 +884,43 @@ def draw_speaker_select():
     display.rectangle(0, 0, WIDTH, 197)
     display.set_pen(BLACK)
     display.rectangle(2, 2, WIDTH-4, 193)
-    
+
     # Draw title
     display.set_pen(WHITE)
     display.text("SELECT SPEAKER", WIDTH//2 - 70, 20, scale=2)
-    
+
     # Calculate spacing and visible items
     start_y = 60
     spacing = 30
     visible_items = 4  # Number of items that fit on screen
-    
+
     # Calculate scroll position
     scroll_start = max(0, current_speaker_index - (visible_items - 1))
     scroll_end = min(len(available_speakers), scroll_start + visible_items)
-    
+
     # Draw speakers
     for i in range(scroll_start, scroll_end):
         y_pos = start_y + ((i - scroll_start) * spacing)
-        
+
         if i == current_speaker_index:
             # Highlight selected speaker
             display.set_pen(GRAY)
             display.rectangle(20, y_pos - 5, WIDTH-40, 25)
-        
+
         display.set_pen(WHITE)
         display.text(available_speakers[i]['name'], 30, y_pos, scale=2)
-    
+
     # Draw scroll indicators if needed
     if scroll_start > 0:
         # Draw up arrow
         display.set_pen(WHITE)
         display.text("^", WIDTH-20, start_y - 20, scale=2)
-    
+
     if scroll_end < len(available_speakers):
         # Draw down arrow
         display.set_pen(WHITE)
         display.text("v", WIDTH-20, start_y + (visible_items * spacing), scale=1)
-    
+
     # Update button labels for this screen
     draw_speaker_select_buttons()
     safe_display_update()
@@ -899,7 +929,7 @@ def draw_speaker_select_buttons():
     """Draw button labels for speaker selection"""
     display.set_pen(BLACK)
     display.rectangle(0, HEIGHT-40, WIDTH, 40)
-    
+
     # Create button labels
     button_positions = [
         ("A", "Select", 30),
@@ -907,21 +937,21 @@ def draw_speaker_select_buttons():
         ("X", "Up", WIDTH-90),
         ("Y", "Down", WIDTH-35)
     ]
-    
+
     for button, label, x_pos in button_positions:
         # Draw button circles
         display.set_pen(GRAY)
         display.circle(x_pos, HEIGHT-20, 7)
-        
+
         # Draw button letters
         display.set_pen(WHITE)
         display.text(button, x_pos-3, HEIGHT-22, scale=1)
         display.text(label, x_pos + (15 if label != "Back" else 10), HEIGHT-22, scale=1)
 
 def handle_speaker_select(button_pressed):
-    """Handle speaker selection navigation and selection"""
-    global current_speaker_index, in_speaker_select, in_menu, current_speaker
-    
+    """Handle speaker selection navigation for X/Y (no HA calls — sync is fine)."""
+    global current_speaker_index, in_speaker_select
+
     if button_pressed == 'X':  # Up
         if len(available_speakers) > 0:
             current_speaker_index = (current_speaker_index - 1) % len(available_speakers)
@@ -930,19 +960,6 @@ def handle_speaker_select(button_pressed):
         if len(available_speakers) > 0:
             current_speaker_index = (current_speaker_index + 1) % len(available_speakers)
             draw_speaker_select()
-    elif button_pressed == 'A':  # Select
-        if len(available_speakers) > 0:
-            current_speaker = available_speakers[current_speaker_index]['entity_id']
-            in_speaker_select = False
-            in_menu = False
-            # Return to main screen
-            new_state = get_sonos_state()
-            if new_state:
-                current_state_data = new_state
-                draw_screen(current_state_data)
-    elif button_pressed == 'B':  # Back
-        in_speaker_select = False
-        draw_menu()
 
 def save_brightness(brightness):
     """Save brightness setting to file"""
@@ -975,36 +992,36 @@ def draw_brightness_screen():
     display.rectangle(0, 0, WIDTH, 197)
     display.set_pen(BLACK)
     display.rectangle(2, 2, WIDTH-4, 193)
-    
+
     # Draw title
     display.set_pen(WHITE)
     display.text("BRIGHTNESS", WIDTH//2 - 50, 20, scale=2)
-    
+
     # Use tracked brightness value
     percent = int(current_brightness * 100)
-    
+
     # Draw percentage
     text = f"{percent}%"
     display.text(text, WIDTH//2 - 20, 60, scale=2)
-    
+
     # Draw brightness bar
     display.set_pen(GRAY)
     display.rectangle(20, 100, WIDTH-40, 20)
     display.set_pen(WHITE)
     bar_width = int((WIDTH-40) * current_brightness)
     display.rectangle(20, 100, bar_width, 20)
-    
+
     # Draw button labels
     display.set_pen(BLACK)
     display.rectangle(0, HEIGHT-40, WIDTH, 40)
-    
+
     # Create button labels
     button_positions = [
         ("B", "Back", 30),
         ("X", "Up", WIDTH-90),
         ("Y", "Down", WIDTH-35)
     ]
-    
+
     for button, label, x_pos in button_positions:
         display.set_pen(GRAY)
         display.circle(x_pos, HEIGHT-20, 7)
@@ -1017,7 +1034,7 @@ def draw_brightness_screen():
 def handle_brightness_control(button_pressed):
     """Handle brightness adjustments"""
     global current_brightness, in_brightness_screen
-    
+
     if button_pressed == 'X':  # Up
         new_brightness = min(1.0, current_brightness + BRIGHTNESS_STEP)
         display.set_backlight(new_brightness)
@@ -1135,8 +1152,165 @@ def button_core():
 
         time.sleep(0.005)
 
+# ---------------------------------------------------------------------------
+# Async tasks
+# ---------------------------------------------------------------------------
 
-def main():
+async def state_poll_task():
+    global last_state_update, current_state_data
+    while True:
+        await asyncio.sleep(state_update_interval)
+        if not is_sleeping and not in_menu and not in_speaker_select and not in_brightness_screen:
+            new_state = await get_sonos_state_async()
+            if new_state and new_state != current_state_data:
+                current_state_data = new_state
+                draw_screen(current_state_data)
+            last_state_update = time.time()
+
+
+async def wifi_check_task():
+    while True:
+        await asyncio.sleep(wifi_check_interval)
+        check_wifi_connection()
+
+# ---------------------------------------------------------------------------
+# Button action loop (Core 0 async)
+# ---------------------------------------------------------------------------
+
+async def button_action_loop():
+    global button_a_short_pending, button_a_long_pending
+    global button_b_short_pending, button_b_long_pending
+    global button_x_tap_pending, button_y_tap_pending
+    global last_x_repeat, last_y_repeat, current_state_data
+    global in_menu, in_speaker_select, in_brightness_screen
+    global any_button_pressed, is_sleeping, last_activity_time
+
+    while True:
+        current_time = time.time()
+
+        # Handle sleep mode
+        if is_sleeping:
+            pulse_led()
+            if any_button_pressed:
+                any_button_pressed = False
+                button_a_short_pending = False
+                button_a_long_pending = False
+                button_b_short_pending = False
+                button_b_long_pending = False
+                button_x_tap_pending = False
+                button_y_tap_pending = False
+                await wake_device_async()
+            await asyncio.sleep(0.1)
+            continue
+
+        # Check sleep timeout
+        if current_time - last_activity_time >= SLEEP_TIMEOUT:
+            enter_sleep_mode()
+            await asyncio.sleep(0.1)
+            continue
+
+        collect_garbage()
+
+        # Button B: menu/back (short) or previous track (long, main screen only)
+        if button_b_long_pending and not in_menu and not in_speaker_select and not in_brightness_screen:
+            button_b_long_pending = False
+            update_activity()
+            await call_ha_service_async("media_previous_track", {"entity_id": current_speaker})
+        elif button_b_short_pending:
+            button_b_short_pending = False
+            button_b_long_pending = False
+            update_activity()
+            if not in_menu and not in_speaker_select and not in_brightness_screen:
+                in_menu = True
+                current_menu_index = 0
+                draw_menu()
+            elif in_speaker_select:
+                in_speaker_select = False
+                draw_menu()
+            elif in_brightness_screen:
+                in_brightness_screen = False
+                draw_menu()
+            else:
+                in_menu = False
+                new_state = await get_sonos_state_async()
+                if new_state:
+                    current_state_data = new_state
+                    draw_screen(new_state)
+
+        # Context-specific buttons
+        if in_speaker_select:
+            if button_a_short_pending:
+                button_a_short_pending = False
+                update_activity()
+                await handle_speaker_select_async('A')
+            if button_x_tap_pending or (button_x_held and current_time - last_x_repeat >= 0.2):
+                button_x_tap_pending = False
+                update_activity()
+                handle_speaker_select('X')
+                last_x_repeat = current_time
+            if button_y_tap_pending or (button_y_held and current_time - last_y_repeat >= 0.2):
+                button_y_tap_pending = False
+                update_activity()
+                handle_speaker_select('Y')
+                last_y_repeat = current_time
+
+        elif in_brightness_screen:
+            if button_x_tap_pending or (button_x_held and current_time - last_x_repeat >= 0.2):
+                button_x_tap_pending = False
+                update_activity()
+                handle_brightness_control('X')
+                last_x_repeat = current_time
+            if button_y_tap_pending or (button_y_held and current_time - last_y_repeat >= 0.2):
+                button_y_tap_pending = False
+                update_activity()
+                handle_brightness_control('Y')
+                last_y_repeat = current_time
+
+        elif in_menu:
+            if button_a_short_pending:
+                button_a_short_pending = False
+                update_activity()
+                await handle_menu_navigation_async('A')
+            if button_x_tap_pending or (button_x_held and current_time - last_x_repeat >= 0.2):
+                button_x_tap_pending = False
+                update_activity()
+                await handle_menu_navigation_async('X')
+                last_x_repeat = current_time
+            if button_y_tap_pending or (button_y_held and current_time - last_y_repeat >= 0.2):
+                button_y_tap_pending = False
+                update_activity()
+                await handle_menu_navigation_async('Y')
+                last_y_repeat = current_time
+
+        else:  # Main playback screen
+            if button_a_long_pending:
+                button_a_long_pending = False
+                update_activity()
+                await call_ha_service_async("media_next_track", {"entity_id": current_speaker})
+            elif button_a_short_pending:
+                button_a_short_pending = False
+                update_activity()
+                await call_ha_service_async("media_play_pause", {"entity_id": current_speaker})
+
+            if button_x_tap_pending or (button_x_held and current_time - last_x_repeat >= 0.3):
+                button_x_tap_pending = False
+                update_activity()
+                await call_ha_service_async("volume_up", {"entity_id": current_speaker})
+                last_x_repeat = current_time
+
+            if button_y_tap_pending or (button_y_held and current_time - last_y_repeat >= 0.3):
+                button_y_tap_pending = False
+                update_activity()
+                await call_ha_service_async("volume_down", {"entity_id": current_speaker})
+                last_y_repeat = current_time
+
+        await asyncio.sleep(0.005)
+
+# ---------------------------------------------------------------------------
+# Async main entry point
+# ---------------------------------------------------------------------------
+
+async def async_main():
     global current_speaker, in_speaker_select, is_sleeping, album_art_response
     global last_button_a_press, last_button_x_press, last_button_y_press
     global button_a_pressed_time, button_x_pressed_time, button_y_pressed_time
@@ -1151,6 +1325,7 @@ def main():
     global button_x_held, button_x_tap_pending
     global button_y_held, button_y_tap_pending
     global any_button_pressed
+    global last_x_repeat, last_y_repeat
 
     # Initialize all global variables
     current_speaker = None
@@ -1195,198 +1370,47 @@ def main():
             # If WiFi connection fails, show message and return
             show_message("WiFi Disconnected")
             return
-    
+
     # Initialize display with default brightness
     display.set_backlight(load_brightness())
-    
+
     # Show loading message before fetching speakers
     show_message("Loading Speakers...")
-    
+
     # Only proceed with speaker selection if WiFi is connected
-    if get_available_speakers():
+    if await get_available_speakers_async():
         in_speaker_select = True
         draw_speaker_select()
     else:
         show_message("No Speakers Found")
         return
-    
+
     # Wait for speaker selection before proceeding
     while not current_speaker:
-        # Handle speaker selection buttons
-        if button_a.value() == 0:  # Select
-            handle_speaker_select('A')
-            time.sleep(0.2)
-        if button_x.value() == 0:  # Up
+        if button_a_short_pending:
+            button_a_short_pending = False
+            await handle_speaker_select_async('A')
+        if button_x_tap_pending:
+            button_x_tap_pending = False
             handle_speaker_select('X')
-            time.sleep(0.2)
-        if button_y.value() == 0:  # Down
+        if button_y_tap_pending:
+            button_y_tap_pending = False
             handle_speaker_select('Y')
-            time.sleep(0.2)
-        time.sleep(0.01)
+        await asyncio.sleep(0.01)
 
     # Start Core 1 button polling thread
     _thread.start_new_thread(button_core, ())
 
-    try:
-        while True:
-            current_time = time.time()
-            
-            # Handle sleep mode first
-            if is_sleeping:
-                pulse_led()
-                # Check for any button press to wake
-                if any_button_pressed:
-                    any_button_pressed = False
-                    # Clear all pending actions so the wake button doesn't also trigger an action
-                    button_a_short_pending = False
-                    button_a_long_pending = False
-                    button_b_short_pending = False
-                    button_b_long_pending = False
-                    button_x_tap_pending = False
-                    button_y_tap_pending = False
-                    wake_device()
-                    # Get fresh state immediately when waking
-                    if not in_menu:
-                        new_state = get_sonos_state()
-                        if new_state:
-                            current_state_data = new_state
-                            draw_screen(new_state)
-                    time.sleep(0.2)  # Debounce
-                time.sleep(0.1)  # Longer sleep while in sleep mode
-                continue  # Skip all other processing while sleeping
-            
-            # Only do these operations when awake
-            if current_time - last_activity_time >= SLEEP_TIMEOUT:
-                enter_sleep_mode()
-                continue
-            
-            # Process album art only when awake
-            if album_art_state == ALBUM_ART_DOWNLOADING:
-                process_album_art(20, 60)
-            
-            # Normal screen updates when awake
-            if current_time - last_state_update >= state_update_interval:
-                if not in_menu and not in_speaker_select and not in_brightness_screen:
-                    new_state = get_sonos_state()
-                    if new_state:
-                        # Only update if state has changed
-                        if new_state != current_state_data:
-                            current_state_data = new_state
-                            draw_screen(current_state_data)
-                last_state_update = current_time
-            
-            # Normal operation mode
-            if current_time - last_wifi_check >= wifi_check_interval:
-                check_wifi_connection()
-                last_wifi_check = current_time
-            
-            collect_garbage()  # Free up memory before processing buttons
-            
-            # Handle button presses (flags set by Core 1)
+    # Launch background tasks
+    asyncio.create_task(state_poll_task())
+    asyncio.create_task(wifi_check_task())
 
-            # Button B: menu/back (short) or previous track (long, main screen only)
-            if button_b_long_pending and not in_menu and not in_speaker_select and not in_brightness_screen:
-                button_b_long_pending = False
-                update_activity()
-                call_ha_service("media_previous_track", {"entity_id": current_speaker})
-            elif button_b_short_pending:
-                button_b_short_pending = False
-                button_b_long_pending = False
-                update_activity()
-                if not in_menu and not in_speaker_select and not in_brightness_screen:
-                    in_menu = True
-                    current_menu_index = 0
-                    draw_menu()
-                elif in_speaker_select:
-                    in_speaker_select = False
-                    draw_menu()
-                elif in_brightness_screen:
-                    in_brightness_screen = False
-                    draw_menu()
-                else:
-                    in_menu = False
-                    new_state = get_sonos_state()
-                    if new_state:
-                        current_state_data = new_state
-                        draw_screen(new_state)
+    # Run the main button action loop
+    await button_action_loop()
 
-            # Context-specific buttons
-            if in_speaker_select:
-                if button_a_short_pending:
-                    button_a_short_pending = False
-                    update_activity()
-                    handle_speaker_select('A')
-                if button_x_tap_pending or (button_x_held and current_time - last_x_repeat >= 0.2):
-                    button_x_tap_pending = False
-                    update_activity()
-                    handle_speaker_select('X')
-                    last_x_repeat = current_time
-                if button_y_tap_pending or (button_y_held and current_time - last_y_repeat >= 0.2):
-                    button_y_tap_pending = False
-                    update_activity()
-                    handle_speaker_select('Y')
-                    last_y_repeat = current_time
 
-            elif in_brightness_screen:
-                if button_x_tap_pending or (button_x_held and current_time - last_x_repeat >= 0.2):
-                    button_x_tap_pending = False
-                    update_activity()
-                    handle_brightness_control('X')
-                    last_x_repeat = current_time
-                if button_y_tap_pending or (button_y_held and current_time - last_y_repeat >= 0.2):
-                    button_y_tap_pending = False
-                    update_activity()
-                    handle_brightness_control('Y')
-                    last_y_repeat = current_time
-
-            elif in_menu:
-                if button_a_short_pending:
-                    button_a_short_pending = False
-                    update_activity()
-                    handle_menu_navigation('A')
-                if button_x_tap_pending or (button_x_held and current_time - last_x_repeat >= 0.2):
-                    button_x_tap_pending = False
-                    update_activity()
-                    handle_menu_navigation('X')
-                    last_x_repeat = current_time
-                if button_y_tap_pending or (button_y_held and current_time - last_y_repeat >= 0.2):
-                    button_y_tap_pending = False
-                    update_activity()
-                    handle_menu_navigation('Y')
-                    last_y_repeat = current_time
-
-            else:  # Main playback screen
-                if button_a_long_pending:
-                    button_a_long_pending = False
-                    update_activity()
-                    call_ha_service("media_next_track", {"entity_id": current_speaker})
-                elif button_a_short_pending:
-                    button_a_short_pending = False
-                    update_activity()
-                    call_ha_service("media_play_pause", {"entity_id": current_speaker})
-
-                if button_x_tap_pending or (button_x_held and current_time - last_x_repeat >= 0.3):
-                    button_x_tap_pending = False
-                    update_activity()
-                    call_ha_service("volume_up", {"entity_id": current_speaker})
-                    last_x_repeat = current_time
-
-                if button_y_tap_pending or (button_y_held and current_time - last_y_repeat >= 0.3):
-                    button_y_tap_pending = False
-                    update_activity()
-                    call_ha_service("volume_down", {"entity_id": current_speaker})
-                    last_y_repeat = current_time
-
-            time.sleep(0.005)  # Main loop sleep
-    finally:
-        # Cleanup
-        if album_art_response:
-            album_art_response.close()
-        try:
-            import os
-            os.remove('album_art.jpg')
-        except:
-            pass
+def main():
+    asyncio.run(async_main())
 
 if __name__ == "__main__":
     main()
