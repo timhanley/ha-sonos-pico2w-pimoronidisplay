@@ -141,9 +141,7 @@ def collect_garbage():
     gc.threshold(gc.mem_free() // 4 + gc.mem_alloc())
 
 def safe_display_update():
-    display_lock.acquire()
     display.update()
-    display_lock.release()
 
 def get_ha_headers():
     return {
@@ -269,19 +267,27 @@ async def call_ha_service_async(service, data):
             if status == 200:
                 ha_connected = True
                 return True
-            display.set_pen(BLACK)
-            display.clear()
-            display.set_pen(WHITE)
-            error_text = "HA Connection Error"
-            display.text(error_text, (WIDTH - len(error_text) * 8) // 2, HEIGHT // 2, scale=1)
-            safe_display_update()
+            display_lock.acquire()
+            try:
+                display.set_pen(BLACK)
+                display.clear()
+                display.set_pen(WHITE)
+                error_text = "HA Connection Error"
+                display.text(error_text, (WIDTH - len(error_text) * 8) // 2, HEIGHT // 2, scale=1)
+                display.update()
+            finally:
+                display_lock.release()
         except:
-            display.set_pen(BLACK)
-            display.clear()
-            display.set_pen(WHITE)
-            error_text = "HA Connection Error"
-            display.text(error_text, (WIDTH - len(error_text) * 8) // 2, HEIGHT // 2, scale=1)
-            safe_display_update()
+            display_lock.acquire()
+            try:
+                display.set_pen(BLACK)
+                display.clear()
+                display.set_pen(WHITE)
+                error_text = "HA Connection Error"
+                display.text(error_text, (WIDTH - len(error_text) * 8) // 2, HEIGHT // 2, scale=1)
+                display.update()
+            finally:
+                display_lock.release()
         if attempt == 0:
             await asyncio.sleep(0.5)
     ha_connected = False
@@ -301,12 +307,16 @@ async def get_available_speakers_async():
         if status is None:
             raise Exception("Cannot reach HA")
     except:
-        display.set_pen(BLACK)
-        display.clear()
-        display.set_pen(WHITE)
-        error_text = "Cannot Reach Home Assistant"
-        display.text(error_text, (WIDTH - len(error_text) * 9) // 2, HEIGHT // 2, scale=2)
-        safe_display_update()
+        display_lock.acquire()
+        try:
+            display.set_pen(BLACK)
+            display.clear()
+            display.set_pen(WHITE)
+            error_text = "Cannot Reach Home Assistant"
+            display.text(error_text, (WIDTH - len(error_text) * 9) // 2, HEIGHT // 2, scale=2)
+            display.update()
+        finally:
+            display_lock.release()
         await asyncio.sleep(2)
         return False
     try:
@@ -444,6 +454,7 @@ def draw_screen(state_data):
     global album_art_loading, current_state_data, album_art_state, current_album_art_url
     global current_album_name, current_album_art
 
+    display_lock.acquire()
     try:
         if state_data is None:
             return
@@ -458,14 +469,14 @@ def draw_screen(state_data):
             display.set_pen(WHITE)
             display.text("WiFi Disconnected", WIDTH//2 - 60, HEIGHT//2, scale=2)
             draw_button_labels()
-            safe_display_update()
+            display.update()
             return
         elif not ha_connected:
             display.set_pen(WHITE)
             display.text("Home Assistant", WIDTH//2 - 60, HEIGHT//2 - 20, scale=2)
             display.text("Unavailable", WIDTH//2 - 40, HEIGHT//2 + 10, scale=2)
             draw_button_labels()
-            safe_display_update()
+            display.update()
             return
 
         # Draw speaker info box
@@ -622,36 +633,32 @@ def draw_screen(state_data):
         # Draw button labels
         draw_button_labels()
 
-        safe_display_update()
-        collect_garbage()
-
-    except Exception as e:
-        print(f"Error drawing state data: {e}")
-        print(f"Error occurred at line: {e.__traceback__.tb_lineno}")  # Debug line number
-        display.text("Display Error", 10, HEIGHT//2, scale=1)
-
-        # Draw button labels
-        draw_button_labels()
-
-        safe_display_update()
+        display.update()
         collect_garbage()
 
     except Exception as e:
         print(f"Critical error in draw_screen: {e}")
-        print(f"Error occurred at line: {e.__traceback__.tb_lineno}")  # Debug line number
+        print(f"Error occurred at line: {e.__traceback__.tb_lineno}")
+
+    finally:
+        display_lock.release()
 
 def show_message(message, scale=2):
     """Helper function to show centered messages"""
-    display.set_pen(BLACK)
-    display.clear()
-    display.set_pen(WHITE)
+    display_lock.acquire()
+    try:
+        display.set_pen(BLACK)
+        display.clear()
+        display.set_pen(WHITE)
 
-    # Calculate center position using 6 pixels per character instead of 8
-    x = WIDTH//2 - (len(message) * 6 * scale)//2
-    y = HEIGHT//2 - (8 * scale)
+        # Calculate center position using 6 pixels per character instead of 8
+        x = WIDTH//2 - (len(message) * 6 * scale)//2
+        y = HEIGHT//2 - (8 * scale)
 
-    display.text(message, x, y, scale=scale)
-    safe_display_update()
+        display.text(message, x, y, scale=scale)
+        display.update()
+    finally:
+        display_lock.release()
 
 def connect_wifi():
     global wifi_connected
@@ -701,36 +708,40 @@ def check_wifi_connection():
 
 def draw_menu():
     """Draw the menu interface"""
-    # Clear the entire screen first
-    display.set_pen(BLACK)
-    display.clear()
+    display_lock.acquire()
+    try:
+        # Clear the entire screen first
+        display.set_pen(BLACK)
+        display.clear()
 
-    # Draw border
-    display.set_pen(GRAY)
-    display.rectangle(0, 0, WIDTH, 197)
-    display.set_pen(BLACK)
-    display.rectangle(2, 2, WIDTH-4, 193)
+        # Draw border
+        display.set_pen(GRAY)
+        display.rectangle(0, 0, WIDTH, 197)
+        display.set_pen(BLACK)
+        display.rectangle(2, 2, WIDTH-4, 193)
 
-    # Draw menu title
-    display.set_pen(WHITE)
-    display.text("MENU", WIDTH//2 - 20, 20, scale=2)
-
-    # Calculate menu item spacing
-    menu_start_y = 60  # Start lower to account for title
-    menu_spacing = 30  # Increase spacing between items
-
-    # Draw menu items
-    for i, item in enumerate(MENU_ITEMS):
-        if i == current_menu_index:
-            # Highlight selected item
-            display.set_pen(GRAY)
-            display.rectangle(20, menu_start_y + (i * menu_spacing) - 5, WIDTH-40, 25)
+        # Draw menu title
         display.set_pen(WHITE)
-        display.text(item, 30, menu_start_y + (i * menu_spacing), scale=2)
+        display.text("MENU", WIDTH//2 - 20, 20, scale=2)
 
-    # Draw button labels
-    draw_button_labels()
-    safe_display_update()
+        # Calculate menu item spacing
+        menu_start_y = 60  # Start lower to account for title
+        menu_spacing = 30  # Increase spacing between items
+
+        # Draw menu items
+        for i, item in enumerate(MENU_ITEMS):
+            if i == current_menu_index:
+                # Highlight selected item
+                display.set_pen(GRAY)
+                display.rectangle(20, menu_start_y + (i * menu_spacing) - 5, WIDTH-40, 25)
+            display.set_pen(WHITE)
+            display.text(item, 30, menu_start_y + (i * menu_spacing), scale=2)
+
+        # Draw button labels
+        draw_button_labels()
+        display.update()
+    finally:
+        display_lock.release()
 
 # ---------------------------------------------------------------------------
 # Async handler functions
@@ -837,8 +848,11 @@ def enter_sleep_mode():
     global is_sleeping
     is_sleeping = True
     display.set_backlight(0)
-    # Clear any button feedback
-    draw_button_labels(True)
+    display_lock.acquire()
+    try:
+        draw_button_labels(True)
+    finally:
+        display_lock.release()
 
 def update_activity():
     """Update the last activity timestamp"""
@@ -859,71 +873,79 @@ def get_album_art(state_data):
 
 def show_loading_screen(message="Loading..."):
     """Show a loading screen with a message"""
-    # Clear the screen and draw border
-    display.set_pen(BLACK)
-    display.clear()
-    display.set_pen(GRAY)
-    display.rectangle(0, 0, WIDTH, 197)
-    display.set_pen(BLACK)
-    display.rectangle(2, 2, WIDTH-4, 193)
+    display_lock.acquire()
+    try:
+        # Clear the screen and draw border
+        display.set_pen(BLACK)
+        display.clear()
+        display.set_pen(GRAY)
+        display.rectangle(0, 0, WIDTH, 197)
+        display.set_pen(BLACK)
+        display.rectangle(2, 2, WIDTH-4, 193)
 
-    # Draw message
-    display.set_pen(WHITE)
-    text_width = len(message) * 12  # Approximate width for scale 2
-    text_x = (WIDTH - text_width) // 2
-    text_y = HEIGHT // 2 - 10
-    display.text(message, text_x, text_y, scale=2)
-    safe_display_update()
+        # Draw message
+        display.set_pen(WHITE)
+        text_width = len(message) * 12  # Approximate width for scale 2
+        text_x = (WIDTH - text_width) // 2
+        text_y = HEIGHT // 2 - 10
+        display.text(message, text_x, text_y, scale=2)
+        display.update()
+    finally:
+        display_lock.release()
 
 def draw_speaker_select():
     """Draw the speaker selection interface"""
-    # Clear the screen and draw border
-    display.set_pen(BLACK)
-    display.clear()
-    display.set_pen(GRAY)
-    display.rectangle(0, 0, WIDTH, 197)
-    display.set_pen(BLACK)
-    display.rectangle(2, 2, WIDTH-4, 193)
+    display_lock.acquire()
+    try:
+        # Clear the screen and draw border
+        display.set_pen(BLACK)
+        display.clear()
+        display.set_pen(GRAY)
+        display.rectangle(0, 0, WIDTH, 197)
+        display.set_pen(BLACK)
+        display.rectangle(2, 2, WIDTH-4, 193)
 
-    # Draw title
-    display.set_pen(WHITE)
-    display.text("SELECT SPEAKER", WIDTH//2 - 70, 20, scale=2)
-
-    # Calculate spacing and visible items
-    start_y = 60
-    spacing = 30
-    visible_items = 4  # Number of items that fit on screen
-
-    # Calculate scroll position
-    scroll_start = max(0, current_speaker_index - (visible_items - 1))
-    scroll_end = min(len(available_speakers), scroll_start + visible_items)
-
-    # Draw speakers
-    for i in range(scroll_start, scroll_end):
-        y_pos = start_y + ((i - scroll_start) * spacing)
-
-        if i == current_speaker_index:
-            # Highlight selected speaker
-            display.set_pen(GRAY)
-            display.rectangle(20, y_pos - 5, WIDTH-40, 25)
-
+        # Draw title
         display.set_pen(WHITE)
-        display.text(available_speakers[i]['name'], 30, y_pos, scale=2)
+        display.text("SELECT SPEAKER", WIDTH//2 - 70, 20, scale=2)
 
-    # Draw scroll indicators if needed
-    if scroll_start > 0:
-        # Draw up arrow
-        display.set_pen(WHITE)
-        display.text("^", WIDTH-20, start_y - 20, scale=2)
+        # Calculate spacing and visible items
+        start_y = 60
+        spacing = 30
+        visible_items = 4  # Number of items that fit on screen
 
-    if scroll_end < len(available_speakers):
-        # Draw down arrow
-        display.set_pen(WHITE)
-        display.text("v", WIDTH-20, start_y + (visible_items * spacing), scale=1)
+        # Calculate scroll position
+        scroll_start = max(0, current_speaker_index - (visible_items - 1))
+        scroll_end = min(len(available_speakers), scroll_start + visible_items)
 
-    # Update button labels for this screen
-    draw_speaker_select_buttons()
-    safe_display_update()
+        # Draw speakers
+        for i in range(scroll_start, scroll_end):
+            y_pos = start_y + ((i - scroll_start) * spacing)
+
+            if i == current_speaker_index:
+                # Highlight selected speaker
+                display.set_pen(GRAY)
+                display.rectangle(20, y_pos - 5, WIDTH-40, 25)
+
+            display.set_pen(WHITE)
+            display.text(available_speakers[i]['name'], 30, y_pos, scale=2)
+
+        # Draw scroll indicators if needed
+        if scroll_start > 0:
+            # Draw up arrow
+            display.set_pen(WHITE)
+            display.text("^", WIDTH-20, start_y - 20, scale=2)
+
+        if scroll_end < len(available_speakers):
+            # Draw down arrow
+            display.set_pen(WHITE)
+            display.text("v", WIDTH-20, start_y + (visible_items * spacing), scale=1)
+
+        # Update button labels for this screen
+        draw_speaker_select_buttons()
+        display.update()
+    finally:
+        display_lock.release()
 
 def draw_speaker_select_buttons():
     """Draw button labels for speaker selection"""
@@ -985,51 +1007,55 @@ def load_brightness():
 
 def draw_brightness_screen():
     """Draw the brightness control interface"""
-    # Clear the screen and draw border
-    display.set_pen(BLACK)
-    display.clear()
-    display.set_pen(GRAY)
-    display.rectangle(0, 0, WIDTH, 197)
-    display.set_pen(BLACK)
-    display.rectangle(2, 2, WIDTH-4, 193)
-
-    # Draw title
-    display.set_pen(WHITE)
-    display.text("BRIGHTNESS", WIDTH//2 - 50, 20, scale=2)
-
-    # Use tracked brightness value
-    percent = int(current_brightness * 100)
-
-    # Draw percentage
-    text = f"{percent}%"
-    display.text(text, WIDTH//2 - 20, 60, scale=2)
-
-    # Draw brightness bar
-    display.set_pen(GRAY)
-    display.rectangle(20, 100, WIDTH-40, 20)
-    display.set_pen(WHITE)
-    bar_width = int((WIDTH-40) * current_brightness)
-    display.rectangle(20, 100, bar_width, 20)
-
-    # Draw button labels
-    display.set_pen(BLACK)
-    display.rectangle(0, HEIGHT-40, WIDTH, 40)
-
-    # Create button labels
-    button_positions = [
-        ("B", "Back", 30),
-        ("X", "Up", WIDTH-90),
-        ("Y", "Down", WIDTH-35)
-    ]
-
-    for button, label, x_pos in button_positions:
+    display_lock.acquire()
+    try:
+        # Clear the screen and draw border
+        display.set_pen(BLACK)
+        display.clear()
         display.set_pen(GRAY)
-        display.circle(x_pos, HEIGHT-20, 7)
-        display.set_pen(WHITE)
-        display.text(button, x_pos-3, HEIGHT-22, scale=1)
-        display.text(label, x_pos + 15, HEIGHT-22, scale=1)
+        display.rectangle(0, 0, WIDTH, 197)
+        display.set_pen(BLACK)
+        display.rectangle(2, 2, WIDTH-4, 193)
 
-    safe_display_update()
+        # Draw title
+        display.set_pen(WHITE)
+        display.text("BRIGHTNESS", WIDTH//2 - 50, 20, scale=2)
+
+        # Use tracked brightness value
+        percent = int(current_brightness * 100)
+
+        # Draw percentage
+        text = f"{percent}%"
+        display.text(text, WIDTH//2 - 20, 60, scale=2)
+
+        # Draw brightness bar
+        display.set_pen(GRAY)
+        display.rectangle(20, 100, WIDTH-40, 20)
+        display.set_pen(WHITE)
+        bar_width = int((WIDTH-40) * current_brightness)
+        display.rectangle(20, 100, bar_width, 20)
+
+        # Draw button labels
+        display.set_pen(BLACK)
+        display.rectangle(0, HEIGHT-40, WIDTH, 40)
+
+        # Create button labels
+        button_positions = [
+            ("B", "Back", 30),
+            ("X", "Up", WIDTH-90),
+            ("Y", "Down", WIDTH-35)
+        ]
+
+        for button, label, x_pos in button_positions:
+            display.set_pen(GRAY)
+            display.circle(x_pos, HEIGHT-20, 7)
+            display.set_pen(WHITE)
+            display.text(button, x_pos-3, HEIGHT-22, scale=1)
+            display.text(label, x_pos + 15, HEIGHT-22, scale=1)
+
+        display.update()
+    finally:
+        display_lock.release()
 
 def handle_brightness_control(button_pressed):
     """Handle brightness adjustments"""
