@@ -29,6 +29,10 @@ from config import WIFI_SSID, WIFI_PASSWORD, HA_URL, HA_TOKEN
 display = PicoGraphics(display=DISPLAY_PICO_DISPLAY_2, pen_type=PEN_RGB565)
 display.set_font("bitmap8")
 WIDTH, HEIGHT = display.get_bounds()
+try:
+    display.set_update_speed(3)  # Maximum SPI speed for fastest updates
+except:
+    pass
 
 # Initialize LED and Buttons
 led = RGBLED(26, 27, 28)  # Pins for Pimoroni Pico Display 2.8"
@@ -1182,15 +1186,33 @@ def button_core():
 # Async tasks
 # ---------------------------------------------------------------------------
 
+def visible_state(state_data):
+    """Extract only the fields that affect what's drawn on screen.
+    Used to avoid redrawing (and re-decoding JPEG) when only media_position changes."""
+    if not state_data:
+        return None
+    a = state_data.get('attributes', {})
+    return (
+        state_data.get('state'),
+        a.get('media_artist'),
+        a.get('media_title'),
+        a.get('media_album_name'),
+        a.get('volume_level'),
+        a.get('friendly_name'),
+    )
+
 async def state_poll_task():
     global last_state_update, current_state_data
     while True:
         await asyncio.sleep(state_update_interval)
         if not is_sleeping and not in_menu and not in_speaker_select and not in_brightness_screen:
             new_state = await get_sonos_state_async()
-            if new_state and new_state != current_state_data:
-                current_state_data = new_state
-                draw_screen(current_state_data)
+            if new_state:
+                if visible_state(new_state) != visible_state(current_state_data):
+                    current_state_data = new_state
+                    draw_screen(current_state_data)
+                else:
+                    current_state_data = new_state  # keep state fresh without redrawing
             last_state_update = time.time()
 
 
