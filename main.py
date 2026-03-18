@@ -1377,6 +1377,9 @@ async def async_main():
     # Show loading message before fetching speakers
     show_message("Loading Speakers...")
 
+    # Start Core 1 button polling thread early so buttons work during speaker selection
+    _thread.start_new_thread(button_core, ())
+
     # Only proceed with speaker selection if WiFi is connected
     if await get_available_speakers_async():
         in_speaker_select = True
@@ -1397,9 +1400,6 @@ async def async_main():
             button_y_tap_pending = False
             handle_speaker_select('Y')
         await asyncio.sleep(0.01)
-
-    # Start Core 1 button polling thread
-    _thread.start_new_thread(button_core, ())
 
     # Launch background tasks
     asyncio.create_task(state_poll_task())
