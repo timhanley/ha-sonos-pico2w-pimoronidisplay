@@ -249,20 +249,30 @@ def draw_button_labels(force_update=False):
     x_active = (current_time - button_x_pressed_time) < BUTTON_FEEDBACK_TIME
     y_active = (current_time - button_y_pressed_time) < BUTTON_FEEDBACK_TIME
     
-    # Create green pen for active buttons
+    # Create pens for button feedback
     GREEN = display.create_pen(0, 128, 0)
-    
+    BLUE = display.create_pen(0, 64, 192)
+
+    # Long press detected when press_start sentinel is -1
+    a_long = (button_a_press_start == -1)
+    b_long = (button_b_press_start == -1)
+
     # Draw button circles with feedback
     button_positions = [
-        ("A", a_active, 30),
-        ("B", b_active, 145),  # Moved B button further right from 135
-        ("X", x_active, WIDTH-90),
-        ("Y", y_active, WIDTH-35)
+        ("A", a_active, a_long, 30),
+        ("B", b_active, b_long, 145),  # Moved B button further right from 135
+        ("X", x_active, False, WIDTH-90),
+        ("Y", y_active, False, WIDTH-35)
     ]
-    
+
     # Draw circles and centered labels
-    for button, active, x_pos in button_positions:
-        display.set_pen(GREEN if active else GRAY)
+    for button, active, long_press, x_pos in button_positions:
+        if long_press:
+            display.set_pen(BLUE)
+        elif active:
+            display.set_pen(GREEN)
+        else:
+            display.set_pen(GRAY)
         display.circle(x_pos, HEIGHT-20, 7)
         
         # Center the letter in the circle
