@@ -118,7 +118,7 @@ in_brightness_screen = False
 PADDING = 20  # Padding for text from screen edges
 
 # Add to the constants section around line 51
-LONG_PRESS_TIME = 0.6  # Reduce from 0.8 to 0.6 seconds to make it easier to control
+LONG_PRESS_TIME = 1.0  # seconds to trigger a long press
 button_a_press_start = 0  # Track when button A was first pressed
 button_b_press_start = 0  # Track when button B was first pressed
 
