@@ -1237,6 +1237,13 @@ def main():
                 # Check for any button press to wake
                 if any_button_pressed:
                     any_button_pressed = False
+                    # Clear all pending actions so the wake button doesn't also trigger an action
+                    button_a_short_pending = False
+                    button_a_long_pending = False
+                    button_b_short_pending = False
+                    button_b_long_pending = False
+                    button_x_tap_pending = False
+                    button_y_tap_pending = False
                     wake_device()
                     # Get fresh state immediately when waking
                     if not in_menu:
