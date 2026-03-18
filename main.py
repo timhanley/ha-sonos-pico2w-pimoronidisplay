@@ -1136,6 +1136,11 @@ def main():
     global current_album_art, current_album_art_url
     global state_data, in_brightness_screen, button_a_press_start
     global button_b_press_start
+    global button_a_short_pending, button_a_long_pending
+    global button_b_short_pending, button_b_long_pending
+    global button_x_held, button_x_tap_pending
+    global button_y_held, button_y_tap_pending
+    global any_button_pressed
 
     # Initialize all global variables
     current_speaker = None
