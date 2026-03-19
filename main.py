@@ -974,13 +974,11 @@ async def wake_device_async():
 # ---------------------------------------------------------------------------
 
 def pulse_led():
-    """Simple blink in sleep mode"""
-    current_time = time.time()
-    # Blink every second
-    if int(current_time) % 2 == 0:
-        led.set_rgb(0, 16, 0)  # Dim green on
+    """Simple blink in sleep mode — 1s on, 1s off cycle"""
+    if (time.ticks_ms() // 1000) % 2 == 0:
+        led.set_rgb(0, 16, 0)
     else:
-        led.set_rgb(0, 0, 0)   # LED off
+        led.set_rgb(0, 0, 0)
 
 def enter_sleep_mode():
     """Enter low power sleep mode"""
@@ -1397,9 +1395,11 @@ async def button_action_loop():
             original_freq = machine.freq()
             machine.freq(48_000_000)  # reduce CPU from 150MHz to 48MHz
 
-            # Lightsleep loop — blocks asyncio intentionally, nothing to do while asleep
+            # Sleep loop — blocks asyncio intentionally, nothing to do while asleep
+            # Note: machine.lightsleep() with a time arg is unreliable on RP2350;
+            # we still save power via reduced CPU freq + WiFi PM set above
             while is_sleeping:
-                machine.lightsleep(200)
+                time.sleep_ms(200)
                 pulse_led()
                 if (button_a.value() == 0 or button_b.value() == 0 or
                         button_x.value() == 0 or button_y.value() == 0):
