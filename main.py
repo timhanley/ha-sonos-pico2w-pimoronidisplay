@@ -99,6 +99,7 @@ current_state_data = None
 album_art_loading = False
 current_download_response = None  # Store the response object globally
 current_album_name = None  # Track current album name
+current_jpeg_data = None  # JPEG bytes kept in RAM (open_file broken in new firmware)
 
 # state constants
 last_state_update = 0
@@ -373,30 +374,38 @@ async def get_available_speakers_async():
 async def album_art_task(url, x, y):
     """Async task: download and decode album art, then immediately update display."""
     global album_art_state, current_album_art, current_album_art_url, album_art_url
+    global current_jpeg_data
     album_art_state = ALBUM_ART_DOWNLOADING
     try:
         import os
         try:
-            os.remove('album_art.jpg')
+            os.remove('/album_art.jpg')
         except:
             pass
-        status = await async_request_to_file(url, get_ha_headers(), 'album_art.jpg')
+        status = await async_request_to_file(url, get_ha_headers(), '/album_art.jpg')
         if status == 200:
+            gc.collect()
+            with open('/album_art.jpg', 'rb') as f:
+                img_data = f.read()
+            if len(img_data) < 100:
+                album_art_state = ALBUM_ART_IDLE
+                return
             display_lock.acquire()
             try:
-                jpeg.open_file('album_art.jpg')
+                jpeg.open_RAM(img_data)
                 jpeg.decode(x, y, jpegdec.JPEG_SCALE_EIGHTH)
                 draw_button_labels()
                 display.update()
             finally:
                 display_lock.release()
+            current_jpeg_data = img_data
             current_album_art = (x, y, jpegdec.JPEG_SCALE_EIGHTH)
             current_album_art_url = url
             album_art_state = ALBUM_ART_READY
         else:
             album_art_state = ALBUM_ART_IDLE
     except Exception as e:
-        print(f"Error downloading album art: {e}")
+        print(f"Error in album_art_task: {e}")
         album_art_state = ALBUM_ART_IDLE
 
 # ---------------------------------------------------------------------------
@@ -466,7 +475,7 @@ def draw_button_labels(force_update=False):
 def draw_screen(state_data):
     """Draw the main screen with the provided state data"""
     global album_art_loading, current_state_data, album_art_state, current_album_art_url
-    global current_album_name, current_album_art
+    global current_album_name, current_album_art, current_jpeg_data
 
     display_lock.acquire()
     try:
@@ -586,6 +595,7 @@ def draw_screen(state_data):
                 # Clear current art and reset state
                 current_album_art = None
                 current_album_art_url = None
+                current_jpeg_data = None
                 album_art_state = ALBUM_ART_IDLE
                 current_album_name = new_album_name  # Update stored album name
 
@@ -609,16 +619,17 @@ def draw_screen(state_data):
             text_x = 20 + (80 - text_width) // 2 + 2  # Added small offset for fine-tuning
             text_y = 40 + (80 - text_height) // 2
             display.text(text, text_x, text_y, scale=1)
-        elif album_art_state == ALBUM_ART_READY and current_album_art is not None:
+        elif album_art_state == ALBUM_ART_READY and current_album_art is not None and current_jpeg_data:
             try:
                 x, y, scale = current_album_art
-                jpeg.open_file('album_art.jpg')
-                jpeg.decode(20, 40, scale)  # Changed to use fixed coordinates instead of x, y
+                jpeg.open_RAM(current_jpeg_data)
+                jpeg.decode(20, 40, scale)
             except Exception as e:
                 print(f"Error drawing album art: {e}")
                 album_art_state = ALBUM_ART_IDLE
                 current_album_art = None
                 current_album_art_url = None
+                current_jpeg_data = None
         else:
             # Draw empty placeholder
             display.set_pen(GRAY)
@@ -661,7 +672,7 @@ def draw_screen_smart(state_data, old_visible, new_visible):
     """Zone-based redraw: only repaint changed regions without display.clear().
     Preserves unchanged zones (e.g. album art) in the framebuffer between updates."""
     global current_state_data, album_art_state, current_album_art_url
-    global current_album_name, current_album_art
+    global current_album_name, current_album_art, current_jpeg_data
 
     display_lock.acquire()
     try:
@@ -746,6 +757,7 @@ def draw_screen_smart(state_data, old_visible, new_visible):
             if new_album_name != current_album_name:
                 current_album_art = None
                 current_album_art_url = None
+                current_jpeg_data = None
                 album_art_state = ALBUM_ART_IDLE
                 current_album_name = new_album_name
                 # Show loading placeholder
@@ -997,15 +1009,15 @@ def update_activity():
     last_activity_time = time.time()
 
 def get_album_art(state_data):
-    """Get album art URL from state data"""
+    """Get album art URL from state data, requesting a small image to fit in RAM."""
     try:
         entity_picture = state_data['attributes'].get('entity_picture')
         if entity_picture:
-            if entity_picture.startswith('/'):
-                return f"{HA_URL}{entity_picture}"
-            return entity_picture
+            url = f"{HA_URL}{entity_picture}" if entity_picture.startswith('/') else entity_picture
+            sep = '&' if '?' in url else '?'
+            return url + sep + 'width=80'
     except:
-        return None
+        pass
     return None
 
 def show_loading_screen(message="Loading..."):
@@ -1396,10 +1408,8 @@ async def button_action_loop():
             machine.freq(48_000_000)  # reduce CPU from 150MHz to 48MHz
 
             # Sleep loop — blocks asyncio intentionally, nothing to do while asleep
-            # Note: machine.lightsleep() with a time arg is unreliable on RP2350;
-            # we still save power via reduced CPU freq + WiFi PM set above
             while is_sleeping:
-                time.sleep_ms(200)
+                machine.lightsleep(200)
                 pulse_led()
                 if (button_a.value() == 0 or button_b.value() == 0 or
                         button_x.value() == 0 or button_y.value() == 0):
