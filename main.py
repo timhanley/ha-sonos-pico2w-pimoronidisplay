@@ -89,6 +89,20 @@ ALBUM_ART_IDLE = 0
 ALBUM_ART_DOWNLOADING = 1
 ALBUM_ART_READY = 2
 jpeg = jpegdec.JPEG(display)
+
+# Pre-allocate JPEG decode buffer now, before WiFi/HTTP fragment the heap.
+# open_file() is broken in newer Pimoroni firmware so we use open_RAM() instead.
+# readinto() fills this buffer with zero extra allocation.
+_jpeg_buf = None
+for _sz in (200_000, 150_000, 100_000):
+    try:
+        _jpeg_buf = bytearray(_sz)
+        print(f"JPEG buffer: {_sz} bytes")
+        break
+    except MemoryError:
+        pass
+if _jpeg_buf is None:
+    print("Warning: no JPEG buffer — album art disabled")
 current_album_art = None
 current_album_art_url = None
 album_art_state = ALBUM_ART_IDLE
@@ -384,21 +398,24 @@ async def album_art_task(url, x, y):
             pass
         status = await async_request_to_file(url, get_ha_headers(), '/album_art.jpg')
         if status == 200:
-            gc.collect()
-            with open('/album_art.jpg', 'rb') as f:
-                img_data = f.read()
-            if len(img_data) < 100:
+            file_size = os.stat('/album_art.jpg')[6]
+            if file_size < 100 or _jpeg_buf is None or file_size > len(_jpeg_buf):
+                print(f"Album art skipped: size={file_size}, buf={len(_jpeg_buf) if _jpeg_buf else 0}")
                 album_art_state = ALBUM_ART_IDLE
                 return
+            # readinto fills the pre-allocated buffer — zero heap allocation
+            with open('/album_art.jpg', 'rb') as f:
+                n = f.readinto(_jpeg_buf)
             display_lock.acquire()
             try:
-                jpeg.open_RAM(img_data)
-                jpeg.decode(x, y, jpegdec.JPEG_SCALE_EIGHTH)
+                j = jpegdec.JPEG(display)
+                j.open_RAM(memoryview(_jpeg_buf)[:n])
+                j.decode(x, y, jpegdec.JPEG_SCALE_EIGHTH)
                 draw_button_labels()
                 display.update()
             finally:
                 display_lock.release()
-            current_jpeg_data = img_data
+            current_jpeg_data = memoryview(_jpeg_buf)[:n]
             current_album_art = (x, y, jpegdec.JPEG_SCALE_EIGHTH)
             current_album_art_url = url
             album_art_state = ALBUM_ART_READY
@@ -619,11 +636,12 @@ def draw_screen(state_data):
             text_x = 20 + (80 - text_width) // 2 + 2  # Added small offset for fine-tuning
             text_y = 40 + (80 - text_height) // 2
             display.text(text, text_x, text_y, scale=1)
-        elif album_art_state == ALBUM_ART_READY and current_album_art is not None and current_jpeg_data:
+        elif album_art_state == ALBUM_ART_READY and current_album_art is not None and current_jpeg_data is not None:
             try:
                 x, y, scale = current_album_art
-                jpeg.open_RAM(current_jpeg_data)
-                jpeg.decode(20, 40, scale)
+                j = jpegdec.JPEG(display)
+                j.open_RAM(current_jpeg_data)
+                j.decode(20, 40, scale)
             except Exception as e:
                 print(f"Error drawing album art: {e}")
                 album_art_state = ALBUM_ART_IDLE
