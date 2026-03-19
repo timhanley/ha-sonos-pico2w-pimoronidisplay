@@ -14,6 +14,7 @@ import math
 from picographics import PicoGraphics, DISPLAY_PICO_DISPLAY_2, PEN_RGB565
 from pimoroni import RGBLED
 from machine import Pin
+import machine
 from io import BytesIO
 try:
     import jpegdec
@@ -128,6 +129,9 @@ button_b_press_start = 0  # Track when button B was first pressed
 
 # Dual-core display lock
 display_lock = _thread.allocate_lock()
+
+# Core 1 lifecycle flag — set True before starting thread, False to stop it
+core1_running = False
 
 # Core 1 → Core 0 action flags (Core 1 sets, Core 0 clears after processing)
 button_a_short_pending = False   # short press (play/pause, menu select)
@@ -1221,13 +1225,14 @@ def button_core():
     global button_y_held, button_y_tap_pending
     global any_button_pressed, last_activity_time
     global button_a_press_start, button_b_press_start
+    global core1_running
 
     a_was_held = False
     b_was_held = False
     x_was_held = False
     y_was_held = False
 
-    while True:
+    while core1_running:
         current_time = time.time()
         any_changed = False
 
@@ -1375,24 +1380,51 @@ async def button_action_loop():
     global button_x_tap_pending, button_y_tap_pending
     global last_x_repeat, last_y_repeat, current_state_data
     global in_menu, in_speaker_select, in_brightness_screen
-    global any_button_pressed, is_sleeping, last_activity_time
+    global any_button_pressed, is_sleeping, last_activity_time, core1_running
 
     while True:
         current_time = time.time()
 
         # Handle sleep mode
         if is_sleeping:
-            pulse_led()
-            if any_button_pressed:
-                any_button_pressed = False
-                button_a_short_pending = False
-                button_a_long_pending = False
-                button_b_short_pending = False
-                button_b_long_pending = False
-                button_x_tap_pending = False
-                button_y_tap_pending = False
-                await wake_device_async()
-            await asyncio.sleep(0.1)
+            # Stop Core 1 so it doesn't conflict with lightsleep
+            core1_running = False
+            time.sleep(0.02)  # give Core 1 time to exit its 5ms polling loop
+
+            # Apply low power settings
+            wlan = network.WLAN(network.STA_IF)
+            wlan.config(pm=0xa11c82)  # aggressive WiFi power save
+            original_freq = machine.freq()
+            machine.freq(48_000_000)  # reduce CPU from 150MHz to 48MHz
+
+            # Lightsleep loop — blocks asyncio intentionally, nothing to do while asleep
+            while is_sleeping:
+                machine.lightsleep(200)
+                pulse_led()
+                if (button_a.value() == 0 or button_b.value() == 0 or
+                        button_x.value() == 0 or button_y.value() == 0):
+                    break  # wake on any button press
+
+            # Restore power settings
+            machine.freq(original_freq)
+            wlan.config(pm=0xa11142)  # restore default WiFi power save
+
+            # Discard any button actions triggered by the wake press
+            button_a_short_pending = False
+            button_a_long_pending = False
+            button_b_short_pending = False
+            button_b_long_pending = False
+            button_x_tap_pending = False
+            button_y_tap_pending = False
+            any_button_pressed = False
+
+            # Restart Core 1
+            core1_running = True
+            _thread.start_new_thread(button_core, ())
+            await asyncio.sleep(0.05)  # give Core 1 time to start
+
+            # Wake display and redraw
+            await wake_device_async()
             continue
 
         # Check sleep timeout
@@ -1516,7 +1548,7 @@ async def async_main():
     global button_b_short_pending, button_b_long_pending
     global button_x_held, button_x_tap_pending
     global button_y_held, button_y_tap_pending
-    global any_button_pressed
+    global any_button_pressed, core1_running
     global last_x_repeat, last_y_repeat
 
     # Initialize all global variables
@@ -1570,6 +1602,7 @@ async def async_main():
     show_message("Loading Speakers...")
 
     # Start Core 1 button polling thread early so buttons work during speaker selection
+    core1_running = True
     _thread.start_new_thread(button_core, ())
 
     # Only proceed with speaker selection if WiFi is connected
