@@ -1432,8 +1432,11 @@ async def button_action_loop():
             machine.freq(48_000_000)  # reduce CPU from 150MHz to 48MHz
 
             # Sleep loop — blocks asyncio intentionally, nothing to do while asleep
+            # time.sleep_ms used instead of machine.lightsleep: lightsleep pauses
+            # the PWM timer that drives the RGB LED, causing erratic flickering.
+            # Power saving from 48MHz CPU + aggressive WiFi PM is still active.
             while is_sleeping:
-                machine.lightsleep(200)
+                time.sleep_ms(200)
                 pulse_led()
                 if (button_a.value() == 0 or button_b.value() == 0 or
                         button_x.value() == 0 or button_y.value() == 0):
@@ -1442,6 +1445,13 @@ async def button_action_loop():
             # Restore power settings
             machine.freq(original_freq)
             wlan.config(pm=0xa11142)  # restore default WiFi power save
+
+            # Wait for the wake button to be fully released before restarting
+            # Core 1 — otherwise Core 1 catches the release and fires the action.
+            while (button_a.value() == 0 or button_b.value() == 0 or
+                    button_x.value() == 0 or button_y.value() == 0):
+                time.sleep_ms(5)
+            time.sleep_ms(50)  # debounce
 
             # Discard any button actions triggered by the wake press
             button_a_short_pending = False
