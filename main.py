@@ -89,20 +89,13 @@ ALBUM_ART_IDLE = 0
 ALBUM_ART_DOWNLOADING = 1
 ALBUM_ART_READY = 2
 jpeg = jpegdec.JPEG(display)
+try:
+    import pngdec
+    png = pngdec.PNG(display)
+except ImportError:
+    pngdec = None
+    png = None
 
-# Pre-allocate JPEG decode buffer now, before WiFi/HTTP fragment the heap.
-# open_file() is broken in newer Pimoroni firmware so we use open_RAM() instead.
-# readinto() fills this buffer with zero extra allocation.
-_jpeg_buf = None
-for _sz in (200_000, 150_000, 100_000):
-    try:
-        _jpeg_buf = bytearray(_sz)
-        print(f"JPEG buffer: {_sz} bytes")
-        break
-    except MemoryError:
-        pass
-if _jpeg_buf is None:
-    print("Warning: no JPEG buffer — album art disabled")
 current_album_art = None
 current_album_art_url = None
 album_art_state = ALBUM_ART_IDLE
@@ -113,7 +106,6 @@ current_state_data = None
 album_art_loading = False
 current_download_response = None  # Store the response object globally
 current_album_name = None  # Track current album name
-current_jpeg_data = None  # JPEG bytes kept in RAM (open_file broken in new firmware)
 
 # state constants
 last_state_update = 0
@@ -386,9 +378,8 @@ async def get_available_speakers_async():
 # ---------------------------------------------------------------------------
 
 async def album_art_task(url, x, y):
-    """Async task: download and decode album art, then immediately update display."""
+    """Download album art to flash, detect PNG vs JPEG, decode with open_file."""
     global album_art_state, current_album_art, current_album_art_url, album_art_url
-    global current_jpeg_data
     album_art_state = ALBUM_ART_DOWNLOADING
     try:
         import os
@@ -398,27 +389,38 @@ async def album_art_task(url, x, y):
             pass
         status = await async_request_to_file(url, get_ha_headers(), '/album_art.jpg')
         if status == 200:
-            file_size = os.stat('/album_art.jpg')[6]
-            if file_size < 100 or _jpeg_buf is None or file_size > len(_jpeg_buf):
-                print(f"Album art skipped: size={file_size}, buf={len(_jpeg_buf) if _jpeg_buf else 0}")
-                album_art_state = ALBUM_ART_IDLE
-                return
-            # readinto fills the pre-allocated buffer — zero heap allocation
             with open('/album_art.jpg', 'rb') as f:
-                n = f.readinto(_jpeg_buf)
+                magic = f.read(4)
             display_lock.acquire()
             try:
-                j = jpegdec.JPEG(display)
-                j.open_RAM(memoryview(_jpeg_buf)[:n])
-                j.decode(x, y, jpegdec.JPEG_SCALE_EIGHTH)
-                draw_button_labels()
+                if magic[:4] == b'\x89PNG' and png is not None:
+                    png.open_file('/album_art.jpg')
+                    iw = png.get_width()
+                    ih = png.get_height()
+                    draw_x = x - (iw - 80) // 2
+                    draw_y = y - (ih - 80) // 2
+                    display.set_clip(x, y, 80, 80)
+                    png.decode(draw_x, draw_y)
+                    display.remove_clip()
+                    fmt = 'png'
+                elif magic[:2] == b'\xff\xd8':
+                    jpeg.open_file('/album_art.jpg')
+                    jpeg.decode(x, y, jpegdec.JPEG_SCALE_EIGHTH)
+                    fmt = 'jpeg'
+                else:
+                    print(f"Album art: unsupported format {magic}")
+                    album_art_state = ALBUM_ART_IDLE
+                    return
+                current_album_art = (x, y, 8, fmt)
+                current_album_art_url = url
+                album_art_state = ALBUM_ART_READY
                 display.update()
+            except Exception as e:
+                print(f"Album art decode error: {e}")
+                album_art_state = ALBUM_ART_IDLE
+                current_album_art = None
             finally:
                 display_lock.release()
-            current_jpeg_data = memoryview(_jpeg_buf)[:n]
-            current_album_art = (x, y, jpegdec.JPEG_SCALE_EIGHTH)
-            current_album_art_url = url
-            album_art_state = ALBUM_ART_READY
         else:
             album_art_state = ALBUM_ART_IDLE
     except Exception as e:
@@ -492,7 +494,7 @@ def draw_button_labels(force_update=False):
 def draw_screen(state_data):
     """Draw the main screen with the provided state data"""
     global album_art_loading, current_state_data, album_art_state, current_album_art_url
-    global current_album_name, current_album_art, current_jpeg_data
+    global current_album_name, current_album_art
 
     display_lock.acquire()
     try:
@@ -612,7 +614,6 @@ def draw_screen(state_data):
                 # Clear current art and reset state
                 current_album_art = None
                 current_album_art_url = None
-                current_jpeg_data = None
                 album_art_state = ALBUM_ART_IDLE
                 current_album_name = new_album_name  # Update stored album name
 
@@ -636,18 +637,26 @@ def draw_screen(state_data):
             text_x = 20 + (80 - text_width) // 2 + 2  # Added small offset for fine-tuning
             text_y = 40 + (80 - text_height) // 2
             display.text(text, text_x, text_y, scale=1)
-        elif album_art_state == ALBUM_ART_READY and current_album_art is not None and current_jpeg_data is not None:
+        elif album_art_state == ALBUM_ART_READY and current_album_art is not None:
             try:
-                x, y, scale = current_album_art
-                j = jpegdec.JPEG(display)
-                j.open_RAM(current_jpeg_data)
-                j.decode(20, 40, scale)
+                x, y, scale, fmt = current_album_art
+                if fmt == 'png' and png is not None:
+                    png.open_file('/album_art.jpg')
+                    iw = png.get_width()
+                    ih = png.get_height()
+                    draw_x = x - (iw - 80) // 2
+                    draw_y = y - (ih - 80) // 2
+                    display.set_clip(x, y, 80, 80)
+                    png.decode(draw_x, draw_y)
+                    display.remove_clip()
+                else:
+                    jpeg.open_file('/album_art.jpg')
+                    jpeg.decode(x, y, scale)
             except Exception as e:
                 print(f"Error drawing album art: {e}")
                 album_art_state = ALBUM_ART_IDLE
                 current_album_art = None
                 current_album_art_url = None
-                current_jpeg_data = None
         else:
             # Draw empty placeholder
             display.set_pen(GRAY)
@@ -690,7 +699,7 @@ def draw_screen_smart(state_data, old_visible, new_visible):
     """Zone-based redraw: only repaint changed regions without display.clear().
     Preserves unchanged zones (e.g. album art) in the framebuffer between updates."""
     global current_state_data, album_art_state, current_album_art_url
-    global current_album_name, current_album_art, current_jpeg_data
+    global current_album_name, current_album_art
 
     display_lock.acquire()
     try:
@@ -775,7 +784,6 @@ def draw_screen_smart(state_data, old_visible, new_visible):
             if new_album_name != current_album_name:
                 current_album_art = None
                 current_album_art_url = None
-                current_jpeg_data = None
                 album_art_state = ALBUM_ART_IDLE
                 current_album_name = new_album_name
                 # Show loading placeholder
@@ -1027,13 +1035,11 @@ def update_activity():
     last_activity_time = time.time()
 
 def get_album_art(state_data):
-    """Get album art URL from state data, requesting a small image to fit in RAM."""
+    """Get album art URL from state data."""
     try:
         entity_picture = state_data['attributes'].get('entity_picture')
         if entity_picture:
-            url = f"{HA_URL}{entity_picture}" if entity_picture.startswith('/') else entity_picture
-            sep = '&' if '?' in url else '?'
-            return url + sep + 'width=80'
+            return f"{HA_URL}{entity_picture}" if entity_picture.startswith('/') else entity_picture
     except:
         pass
     return None
