@@ -99,6 +99,7 @@ except ImportError:
 current_album_art = None
 current_album_art_url = None
 album_art_state = ALBUM_ART_IDLE
+_art_pixel_cache = None  # bytearray of 80×80 RGB565 pixels decoded from PNG, or None
 album_art_response = None
 album_art_url = None
 state_data = None
@@ -374,12 +375,342 @@ async def get_available_speakers_async():
         collect_garbage()
 
 # ---------------------------------------------------------------------------
+# PNG thumbnail decoder — full-image scaling via streaming IDAT decode
+# ---------------------------------------------------------------------------
+
+_IDAT_TMP = '/idat.tmp'
+
+
+@micropython.viper
+def _png_unfilter_sub(row: ptr8, n: int, bpp: int):
+    i = bpp
+    while i < n:
+        row[i] = (int(row[i]) + int(row[i - bpp])) & 0xFF
+        i += 1
+
+
+@micropython.viper
+def _png_unfilter_up(row: ptr8, prev: ptr8, n: int):
+    i = 0
+    while i < n:
+        row[i] = (int(row[i]) + int(prev[i])) & 0xFF
+        i += 1
+
+
+@micropython.viper
+def _png_unfilter_avg(row: ptr8, prev: ptr8, n: int, bpp: int):
+    i = 0
+    while i < n:
+        b = int(prev[i])
+        if i >= bpp:
+            a = int(row[i - bpp])
+        else:
+            a = 0
+        row[i] = (int(row[i]) + ((a + b) >> 1)) & 0xFF
+        i += 1
+
+
+@micropython.viper
+def _png_unfilter_paeth(row: ptr8, prev: ptr8, n: int, bpp: int):
+    i = 0
+    while i < n:
+        b = int(prev[i])
+        if i >= bpp:
+            a = int(row[i - bpp])
+            c = int(prev[i - bpp])
+        else:
+            a = 0
+            c = 0
+        p = a + b - c
+        pa = p - a
+        if pa < 0:
+            pa = -pa
+        pb = p - b
+        if pb < 0:
+            pb = -pb
+        pc = p - c
+        if pc < 0:
+            pc = -pc
+        if pa <= pb:
+            if pa <= pc:
+                pr = a
+            else:
+                pr = c
+        else:
+            if pb <= pc:
+                pr = b
+            else:
+                pr = c
+        row[i] = (int(row[i]) + pr) & 0xFF
+        i += 1
+
+
+@micropython.viper
+def _png_accum_row(row: ptr8, acc: ptr8, out_w: int, src_w: int, bpp: int):
+    """Accumulate one source row into acc using horizontal box averaging.
+    acc: bytearray of out_w*6 bytes — three uint16-LE (R,G,B) per output pixel."""
+    x = 0
+    while x < out_w:
+        sx0 = x * src_w // out_w
+        sx1 = (x + 1) * src_w // out_w
+        if sx1 == sx0:
+            sx1 = sx0 + 1
+        r_s = 0
+        g_s = 0
+        b_s = 0
+        sx = sx0
+        while sx < sx1:
+            pi = sx * bpp
+            r_s += int(row[pi])
+            g_s += int(row[pi + 1])
+            b_s += int(row[pi + 2])
+            sx += 1
+        cnt = sx1 - sx0
+        # Average horizontally, add into accumulator (uint16-LE at acc[x*6..x*6+5])
+        ai = x * 6
+        r_a = (int(acc[ai]) | (int(acc[ai + 1]) << 8)) + r_s // cnt
+        g_a = (int(acc[ai + 2]) | (int(acc[ai + 3]) << 8)) + g_s // cnt
+        b_a = (int(acc[ai + 4]) | (int(acc[ai + 5]) << 8)) + b_s // cnt
+        acc[ai]     = r_a & 0xFF
+        acc[ai + 1] = (r_a >> 8) & 0xFF
+        acc[ai + 2] = g_a & 0xFF
+        acc[ai + 3] = (g_a >> 8) & 0xFF
+        acc[ai + 4] = b_a & 0xFF
+        acc[ai + 5] = (b_a >> 8) & 0xFF
+        x += 1
+
+
+@micropython.viper
+def _png_finalize_row(acc: ptr8, out: ptr8, out_y: int, out_w: int, box_h: int):
+    """Divide acc by box_h, write RGB565 (little-endian) to out row, clear acc."""
+    x = 0
+    base = out_y * out_w * 2
+    while x < out_w:
+        ai = x * 6
+        r = (int(acc[ai]) | (int(acc[ai + 1]) << 8)) // box_h
+        g = (int(acc[ai + 2]) | (int(acc[ai + 3]) << 8)) // box_h
+        b = (int(acc[ai + 4]) | (int(acc[ai + 5]) << 8)) // box_h
+        if r > 255:
+            r = 255
+        if g > 255:
+            g = 255
+        if b > 255:
+            b = 255
+        pixel = ((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3)
+        oi = base + x * 2
+        out[oi]     = pixel >> 8         # high byte first — PicoGraphics framebuffer is big-endian on wire
+        out[oi + 1] = pixel & 0xFF
+        acc[ai]     = 0
+        acc[ai + 1] = 0
+        acc[ai + 2] = 0
+        acc[ai + 3] = 0
+        acc[ai + 4] = 0
+        acc[ai + 5] = 0
+        x += 1
+
+
+def png_decode_thumbnail(path, out_w=80, out_h=80):
+    """Decode a PNG to an out_w×out_h RGB565 bytearray using box averaging.
+
+    For single-IDAT PNGs (common for album art) decompresses directly from the
+    source file after seeking — no temp file write needed. Falls back to
+    /idat.tmp only when multiple IDAT chunks are present.
+    Returns bytearray on success, None on failure."""
+    try:
+        import deflate
+    except ImportError:
+        print("PNG decode: deflate module not available")
+        return None
+    gc.collect()
+    f = None
+    use_tmp = False
+    try:
+        f = open(path, 'rb')
+        if f.read(8)[:4] != b'\x89PNG':
+            return None
+        # Parse IHDR
+        hdr = f.read(8)
+        if hdr[4:8] != b'IHDR':
+            return None
+        ihdr = f.read(13)
+        iw = (ihdr[0] << 24) | (ihdr[1] << 16) | (ihdr[2] << 8) | ihdr[3]
+        ih = (ihdr[4] << 24) | (ihdr[5] << 16) | (ihdr[6] << 8) | ihdr[7]
+        bit_depth = ihdr[8]
+        color_type = ihdr[9]
+        interlace = ihdr[12]
+        f.read(4)  # IHDR CRC
+        if bit_depth != 8 or interlace != 0:
+            print(f"PNG: unsupported bit_depth={bit_depth} interlace={interlace}")
+            return None
+        if color_type == 2:
+            bpp = 3
+        elif color_type == 6:
+            bpp = 4
+        else:
+            print(f"PNG: unsupported color type {color_type}")
+            return None
+
+        # Scan all chunks to find IDAT locations (reads only 8-byte headers, seeks past data)
+        idat_segs = []   # list of (file_offset_of_data, data_len)
+        while True:
+            chdr = f.read(8)
+            if len(chdr) < 8:
+                break
+            dlen = (chdr[0] << 24) | (chdr[1] << 16) | (chdr[2] << 8) | chdr[3]
+            ctype = chdr[4:8]
+            if ctype == b'IEND':
+                break
+            elif ctype == b'IDAT':
+                idat_segs.append((f.tell(), dlen))
+            f.seek(dlen + 4, 1)   # seek past data + CRC (SEEK_CUR)
+        if not idat_segs:
+            print("PNG: no IDAT chunks found")
+            return None
+
+        # Prepare the ZLIB source
+        if len(idat_segs) == 1:
+            # Single IDAT: seek back to data start and decompress in-place — no temp file
+            f.seek(idat_segs[0][0])
+            zlib = deflate.DeflateIO(f, deflate.ZLIB)
+        else:
+            # Multiple IDAT: concatenate payloads.
+            # Try BytesIO (RAM) first — avoids flash write entirely.
+            # Fall back to /idat.tmp if a MemoryError occurs.
+            total_idat = sum(dlen for _, dlen in idat_segs)
+            bio = None
+            try:
+                from io import BytesIO
+                idat_data = bytearray(total_idat)
+                idx = 0
+                for seg_start, seg_len in idat_segs:
+                    f.seek(seg_start)
+                    remaining = seg_len
+                    while remaining > 0:
+                        n = min(remaining, 4096)
+                        got = f.readinto(memoryview(idat_data)[idx:idx + n])
+                        if not got:
+                            break
+                        idx += got
+                        remaining -= got
+                bio = BytesIO(idat_data)
+                del idat_data
+                gc.collect()
+            except (MemoryError, ImportError):
+                bio = None
+            if bio is not None:
+                f.close()
+                f = bio
+            else:
+                # Flash fallback: write to /idat.tmp
+                buf = bytearray(4096)
+                with open(_IDAT_TMP, 'wb') as tmp:
+                    for seg_start, seg_len in idat_segs:
+                        f.seek(seg_start)
+                        remaining = seg_len
+                        while remaining > 0:
+                            n = min(remaining, len(buf))
+                            got = f.readinto(memoryview(buf)[:n])
+                            if not got:
+                                break
+                            tmp.write(memoryview(buf)[:got])
+                            remaining -= got
+                f.close()
+                f = open(_IDAT_TMP, 'rb')
+                use_tmp = True
+            zlib = deflate.DeflateIO(f, deflate.ZLIB)
+
+        # Decode rows with box averaging
+        row_stride = iw * bpp
+        out = bytearray(out_w * out_h * 2)
+        row = bytearray(row_stride)
+        prev = bytearray(row_stride)
+        acc = bytearray(out_w * 6)   # 3× uint16-LE per output pixel (R, G, B sums)
+        out_y = 0
+        row_in_box = 0
+        for src_y in range(ih):
+            if out_y >= out_h:
+                break
+            fb = zlib.read(1)
+            if not fb:
+                break
+            filter_type = fb[0]
+            offset = 0
+            while offset < row_stride:
+                chunk = zlib.read(row_stride - offset)
+                if not chunk:
+                    break
+                clen = len(chunk)
+                row[offset:offset + clen] = chunk
+                offset += clen
+            if offset < row_stride:
+                break
+            if filter_type == 1:
+                _png_unfilter_sub(row, row_stride, bpp)
+            elif filter_type == 2:
+                _png_unfilter_up(row, prev, row_stride)
+            elif filter_type == 3:
+                _png_unfilter_avg(row, prev, row_stride, bpp)
+            elif filter_type == 4:
+                _png_unfilter_paeth(row, prev, row_stride, bpp)
+            _png_accum_row(row, acc, out_w, iw, bpp)
+            row_in_box += 1
+            if src_y + 1 >= (out_y + 1) * ih // out_h or src_y + 1 >= ih:
+                _png_finalize_row(acc, out, out_y, out_w, row_in_box)
+                out_y += 1
+                row_in_box = 0
+            row, prev = prev, row
+        if out_y < out_h:
+            print(f"PNG: only decoded {out_y}/{out_h} rows")
+        return out
+    except Exception as e:
+        print(f"PNG decode error: {e}")
+        return None
+    finally:
+        if f:
+            f.close()
+        if use_tmp:
+            try:
+                import os
+                os.remove(_IDAT_TMP)
+            except:
+                pass
+
+
+def _draw_art_cache(x, y, w, h):
+    """Draw the PNG pixel cache to the display framebuffer.
+    Cache stores pixels as [high_byte, low_byte] per pixel — big-endian wire order,
+    matching both the direct framebuffer layout and the byte-swapped pen value.
+    Fast path: copy rows directly via memoryview(display).
+    Fallback: set_pen/pixel loop."""
+    if _art_pixel_cache is None:
+        return
+    cache = _art_pixel_cache
+    try:
+        fb = memoryview(display)
+        for row in range(h):
+            src = row * w * 2
+            dst = ((y + row) * WIDTH + x) * 2
+            fb[dst:dst + w * 2] = cache[src:src + w * 2]
+        return
+    except TypeError:
+        pass  # display doesn't support buffer protocol — use fallback
+    idx = 0
+    for py in range(h):
+        for px in range(w):
+            pen = cache[idx] | (cache[idx + 1] << 8)   # little-endian read
+            display.set_pen(pen)
+            display.pixel(x + px, y + py)
+            idx += 2
+
+
+# ---------------------------------------------------------------------------
 # Album art — async task
 # ---------------------------------------------------------------------------
 
 async def album_art_task(url, x, y):
-    """Download album art to flash, detect PNG vs JPEG, decode with open_file."""
+    """Download album art, decode to 80×80 pixel cache (PNG) or decode JPEG directly."""
     global album_art_state, current_album_art, current_album_art_url, album_art_url
+    global _art_pixel_cache
     album_art_state = ALBUM_ART_DOWNLOADING
     try:
         import os
@@ -391,36 +722,46 @@ async def album_art_task(url, x, y):
         if status == 200:
             with open('/album_art.jpg', 'rb') as f:
                 magic = f.read(4)
-            display_lock.acquire()
-            try:
-                if magic[:4] == b'\x89PNG' and png is not None:
-                    png.open_file('/album_art.jpg')
-                    iw = png.get_width()
-                    ih = png.get_height()
-                    draw_x = x - (iw - 80) // 2
-                    draw_y = y - (ih - 80) // 2
-                    display.set_clip(x, y, 80, 80)
-                    png.decode(draw_x, draw_y)
-                    display.remove_clip()
-                    fmt = 'png'
-                elif magic[:2] == b'\xff\xd8':
-                    jpeg.open_file('/album_art.jpg')
-                    jpeg.decode(x, y, jpegdec.JPEG_SCALE_EIGHTH)
-                    fmt = 'jpeg'
-                else:
-                    print(f"Album art: unsupported format {magic}")
+            if magic[:4] == b'\x89PNG':
+                # Decode PNG to 80×80 pixel cache — full-image scaling, no crop
+                cache = png_decode_thumbnail('/album_art.jpg', 80, 80)
+                if cache is None:
+                    print("PNG thumbnail decode failed")
                     album_art_state = ALBUM_ART_IDLE
                     return
-                current_album_art = (x, y, 8, fmt)
-                current_album_art_url = url
-                album_art_state = ALBUM_ART_READY
-                display.update()
-            except Exception as e:
-                print(f"Album art decode error: {e}")
+                _art_pixel_cache = cache
+                display_lock.acquire()
+                try:
+                    _draw_art_cache(x, y, 80, 80)
+                    current_album_art = (x, y, 80, 'png_cache')
+                    current_album_art_url = url
+                    album_art_state = ALBUM_ART_READY
+                    display.update()
+                except Exception as e:
+                    print(f"Album art draw error: {e}")
+                    album_art_state = ALBUM_ART_IDLE
+                    current_album_art = None
+                    _art_pixel_cache = None
+                finally:
+                    display_lock.release()
+            elif magic[:2] == b'\xff\xd8':
+                display_lock.acquire()
+                try:
+                    jpeg.open_file('/album_art.jpg')
+                    jpeg.decode(x, y, jpegdec.JPEG_SCALE_EIGHTH)
+                    current_album_art = (x, y, jpegdec.JPEG_SCALE_EIGHTH, 'jpeg')
+                    current_album_art_url = url
+                    album_art_state = ALBUM_ART_READY
+                    display.update()
+                except Exception as e:
+                    print(f"Album art decode error: {e}")
+                    album_art_state = ALBUM_ART_IDLE
+                    current_album_art = None
+                finally:
+                    display_lock.release()
+            else:
+                print(f"Album art: unsupported format {magic}")
                 album_art_state = ALBUM_ART_IDLE
-                current_album_art = None
-            finally:
-                display_lock.release()
         else:
             album_art_state = ALBUM_ART_IDLE
     except Exception as e:
@@ -640,15 +981,8 @@ def draw_screen(state_data):
         elif album_art_state == ALBUM_ART_READY and current_album_art is not None:
             try:
                 x, y, scale, fmt = current_album_art
-                if fmt == 'png' and png is not None:
-                    png.open_file('/album_art.jpg')
-                    iw = png.get_width()
-                    ih = png.get_height()
-                    draw_x = x - (iw - 80) // 2
-                    draw_y = y - (ih - 80) // 2
-                    display.set_clip(x, y, 80, 80)
-                    png.decode(draw_x, draw_y)
-                    display.remove_clip()
+                if fmt == 'png_cache':
+                    _draw_art_cache(x, y, scale, scale)
                 else:
                     jpeg.open_file('/album_art.jpg')
                     jpeg.decode(x, y, scale)
