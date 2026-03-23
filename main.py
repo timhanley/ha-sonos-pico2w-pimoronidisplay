@@ -817,15 +817,19 @@ def draw_button_labels(force_update=False):
         display.text(button, x_pos-3, HEIGHT-22, scale=1)
 
     display.set_pen(WHITE)
-    # Draw function labels
-    if in_menu:
+    # Draw function labels — must match the active screen context
+    if in_menu or in_speaker_select:
         display.text("Select", 45, HEIGHT-22, scale=1)
-        display.text("Back", 160, HEIGHT-22, scale=1)  # Moved label right from 150
+        display.text("Back", 160, HEIGHT-22, scale=1)
+        display.text("Up", WIDTH-75, HEIGHT-22, scale=1)
+        display.text("Down", WIDTH-25, HEIGHT-22, scale=1)
+    elif in_brightness_screen:
+        display.text("Back", 160, HEIGHT-22, scale=1)
         display.text("Up", WIDTH-75, HEIGHT-22, scale=1)
         display.text("Down", WIDTH-25, HEIGHT-22, scale=1)
     else:
         display.text("Play/Pause > Next", 45, HEIGHT-22, scale=1)
-        display.text("Menu < Prev", 160, HEIGHT-22, scale=1)  # Moved label right from 150
+        display.text("Menu < Prev", 160, HEIGHT-22, scale=1)
         display.text("Vol+", WIDTH-75, HEIGHT-22, scale=1)
         display.text("Vol-", WIDTH-25, HEIGHT-22, scale=1)
 
@@ -1448,34 +1452,11 @@ def draw_speaker_select():
             display.set_pen(WHITE)
             display.text("v", WIDTH-20, start_y + (visible_items * spacing), scale=1)
 
-        # Update button labels for this screen
-        draw_speaker_select_buttons()
+        draw_button_labels()
         display.update()
     finally:
         display_lock.release()
 
-def draw_speaker_select_buttons():
-    """Draw button labels for speaker selection"""
-    display.set_pen(BLACK)
-    display.rectangle(0, HEIGHT-40, WIDTH, 40)
-
-    # Create button labels
-    button_positions = [
-        ("A", "Select", 30),
-        ("B", "Back", 120),
-        ("X", "Up", WIDTH-90),
-        ("Y", "Down", WIDTH-35)
-    ]
-
-    for button, label, x_pos in button_positions:
-        # Draw button circles
-        display.set_pen(GRAY)
-        display.circle(x_pos, HEIGHT-20, 7)
-
-        # Draw button letters
-        display.set_pen(WHITE)
-        display.text(button, x_pos-3, HEIGHT-22, scale=1)
-        display.text(label, x_pos + (15 if label != "Back" else 10), HEIGHT-22, scale=1)
 
 def handle_speaker_select(button_pressed):
     """Handle speaker selection navigation for X/Y (no HA calls — sync is fine)."""
@@ -1542,24 +1523,7 @@ def draw_brightness_screen():
         bar_width = int((WIDTH-40) * current_brightness)
         display.rectangle(20, 100, bar_width, 20)
 
-        # Draw button labels
-        display.set_pen(BLACK)
-        display.rectangle(0, HEIGHT-40, WIDTH, 40)
-
-        # Create button labels
-        button_positions = [
-            ("B", "Back", 30),
-            ("X", "Up", WIDTH-90),
-            ("Y", "Down", WIDTH-35)
-        ]
-
-        for button, label, x_pos in button_positions:
-            display.set_pen(GRAY)
-            display.circle(x_pos, HEIGHT-20, 7)
-            display.set_pen(WHITE)
-            display.text(button, x_pos-3, HEIGHT-22, scale=1)
-            display.text(label, x_pos + 15, HEIGHT-22, scale=1)
-
+        draw_button_labels()
         display.update()
     finally:
         display_lock.release()
@@ -1599,6 +1563,11 @@ def button_core():
     b_was_held = False
     x_was_held = False
     y_was_held = False
+    # ms-precision timestamps for long press duration — avoids integer time.time()
+    # truncation causing false long presses when buttons are pressed twice quickly.
+    a_press_start_ms = 0
+    b_press_start_ms = 0
+    long_press_ms = int(LONG_PRESS_TIME * 1000)
 
     while core1_running:
         current_time = time.time()
@@ -1609,11 +1578,12 @@ def button_core():
             any_button_pressed = True
             if not a_was_held:
                 a_was_held = True
-                button_a_press_start = current_time
+                button_a_press_start = 1  # sentinel: held (>0), actual timing via a_press_start_ms
+                a_press_start_ms = time.ticks_ms()
                 button_a_pressed_time = current_time
                 last_activity_time = current_time
                 any_changed = True
-            elif button_a_press_start > 0 and (current_time - button_a_press_start) >= LONG_PRESS_TIME:
+            elif button_a_press_start > 0 and time.ticks_diff(time.ticks_ms(), a_press_start_ms) >= long_press_ms:
                 button_a_press_start = -1
                 button_a_pressed_time = current_time
                 button_a_long_pending = True
@@ -1632,11 +1602,12 @@ def button_core():
             any_button_pressed = True
             if not b_was_held:
                 b_was_held = True
-                button_b_press_start = current_time
+                button_b_press_start = 1  # sentinel: held (>0), actual timing via b_press_start_ms
+                b_press_start_ms = time.ticks_ms()
                 button_b_pressed_time = current_time
                 last_activity_time = current_time
                 any_changed = True
-            elif button_b_press_start > 0 and (current_time - button_b_press_start) >= LONG_PRESS_TIME:
+            elif button_b_press_start > 0 and time.ticks_diff(time.ticks_ms(), b_press_start_ms) >= long_press_ms:
                 button_b_press_start = -1
                 button_b_pressed_time = current_time
                 button_b_long_pending = True
