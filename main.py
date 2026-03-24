@@ -1014,10 +1014,12 @@ def draw_screen(state_data):
                 if album_art_url:
                     _cancel_album_art()
                     _album_art_task_handle = asyncio.create_task(album_art_task(album_art_url, 20, 40))
+                    album_art_state = ALBUM_ART_DOWNLOADING
             elif album_art_state == ALBUM_ART_IDLE and album_art_url and not current_album_art:
                 # No album change but we need to load art
                 _cancel_album_art()
                 _album_art_task_handle = asyncio.create_task(album_art_task(album_art_url, 20, 40))
+                album_art_state = ALBUM_ART_DOWNLOADING
 
         # Draw placeholder or current album art
         if album_art_state in (ALBUM_ART_DOWNLOADING, ALBUM_ART_DECODING):
@@ -1186,9 +1188,11 @@ def draw_screen_smart(state_data, old_visible, new_visible):
                 if album_art_url:
                     _cancel_album_art()
                     _album_art_task_handle = asyncio.create_task(album_art_task(album_art_url, 20, 40))
+                    album_art_state = ALBUM_ART_DOWNLOADING
             elif album_art_state == ALBUM_ART_IDLE and album_art_url and not current_album_art:
                 _cancel_album_art()
                 _album_art_task_handle = asyncio.create_task(album_art_task(album_art_url, 20, 40))
+                album_art_state = ALBUM_ART_DOWNLOADING
 
         # Volume zone: volume_level[4] changed
         if new_visible[4] != old_visible[4]:
@@ -1835,8 +1839,10 @@ async def button_action_loop():
             await wake_device_async()
             continue
 
-        # Check sleep timeout
-        if current_time - last_activity_time >= SLEEP_TIMEOUT:
+        # Check sleep timeout — suppress while album art is loading so the decode
+        # isn't interrupted and left invisible behind a dark screen.
+        if (current_time - last_activity_time >= SLEEP_TIMEOUT and
+                album_art_state not in (ALBUM_ART_DOWNLOADING, ALBUM_ART_DECODING)):
             enter_sleep_mode()
             await asyncio.sleep(0.1)
             continue
