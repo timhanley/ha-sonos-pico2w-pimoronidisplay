@@ -86,8 +86,9 @@ is_sleeping = False
 
 # Constants for album art states
 ALBUM_ART_IDLE = 0
-ALBUM_ART_DOWNLOADING = 1
+ALBUM_ART_DOWNLOADING = 1   # HTTP connection active — state poll skipped to protect CYW43
 ALBUM_ART_READY = 2
+ALBUM_ART_DECODING = 3      # File downloaded, decode in progress — state poll OK
 jpeg = jpegdec.JPEG(display)
 try:
     import pngdec
@@ -99,7 +100,8 @@ except ImportError:
 current_album_art = None
 current_album_art_url = None
 album_art_state = ALBUM_ART_IDLE
-_art_pixel_cache = None  # bytearray of 80×80 RGB565 pixels decoded from PNG, or None
+_art_pixel_cache = None      # bytearray of 80×80 RGB565 pixels decoded from PNG, or None
+_album_art_task_handle = None  # asyncio Task for the current download/decode, or None
 album_art_response = None
 album_art_url = None
 state_data = None
@@ -509,12 +511,13 @@ def _png_finalize_row(acc: ptr8, out: ptr8, out_y: int, out_w: int, box_h: int):
         x += 1
 
 
-def png_decode_thumbnail(path, out_w=80, out_h=80):
+async def png_decode_thumbnail(path, out_w=80, out_h=80):
     """Decode a PNG to an out_w×out_h RGB565 bytearray using box averaging.
 
     For single-IDAT PNGs (common for album art) decompresses directly from the
     source file after seeking — no temp file write needed. Falls back to
     /idat.tmp only when multiple IDAT chunks are present.
+    Yields to the asyncio event loop every row so buttons stay responsive.
     Returns bytearray on success, None on failure."""
     try:
         import deflate
@@ -522,6 +525,8 @@ def png_decode_thumbnail(path, out_w=80, out_h=80):
         print("PNG decode: deflate module not available")
         return None
     gc.collect()
+    t0 = time.ticks_ms()
+    print(f"PNG decode start, free={gc.mem_free()}")
     f = None
     use_tmp = False
     try:
@@ -566,6 +571,7 @@ def png_decode_thumbnail(path, out_w=80, out_h=80):
         if not idat_segs:
             print("PNG: no IDAT chunks found")
             return None
+        print(f"PNG {iw}x{ih} bpp={bpp} idat={len(idat_segs)} t={time.ticks_diff(time.ticks_ms(),t0)}ms")
 
         # Prepare the ZLIB source
         if len(idat_segs) == 1:
@@ -627,6 +633,8 @@ def png_decode_thumbnail(path, out_w=80, out_h=80):
         acc = bytearray(out_w * 6)   # 3× uint16-LE per output pixel (R, G, B sums)
         out_y = 0
         row_in_box = 0
+        t_loop = time.ticks_ms()
+        print(f"PNG decode loop start t={time.ticks_diff(t_loop,t0)}ms")
         for src_y in range(ih):
             if out_y >= out_h:
                 break
@@ -659,13 +667,19 @@ def png_decode_thumbnail(path, out_w=80, out_h=80):
                 out_y += 1
                 row_in_box = 0
             row, prev = prev, row
+            if src_y % 50 == 49:
+                print(f"PNG row {src_y+1}/{ih} t={time.ticks_diff(time.ticks_ms(),t_loop)}ms")
+            if src_y % 5 == 4:
+                await asyncio.sleep(0)  # yield every 5 rows — buttons respond within ~200ms
+        total_ms = time.ticks_diff(time.ticks_ms(), t0)
         if out_y < out_h:
-            print(f"PNG: only decoded {out_y}/{out_h} rows")
+            print(f"PNG: only decoded {out_y}/{out_h} rows in {total_ms}ms")
+        else:
+            print(f"PNG decode done: {out_y} rows in {total_ms}ms")
         return out
-    except Exception as e:
-        print(f"PNG decode error: {e}")
-        return None
     finally:
+        # try/finally (no except) — required for await asyncio.sleep(0) to work
+        # correctly in MicroPython. Exceptions propagate to album_art_task's handler.
         if f:
             f.close()
         if use_tmp:
@@ -704,27 +718,54 @@ def _draw_art_cache(x, y, w, h):
 
 
 # ---------------------------------------------------------------------------
-# Album art — async task
+# Album art — cancellation helper + async task
 # ---------------------------------------------------------------------------
+
+def _cancel_album_art():
+    """Cancel any in-progress album art download/decode and reset state to IDLE.
+    Safe to call even when no task is running."""
+    global _album_art_task_handle, album_art_state, current_album_art, _art_pixel_cache
+    if _album_art_task_handle is not None:
+        try:
+            _album_art_task_handle.cancel()
+        except:
+            pass
+        _album_art_task_handle = None
+    if album_art_state in (ALBUM_ART_DOWNLOADING, ALBUM_ART_DECODING):
+        album_art_state = ALBUM_ART_IDLE
+        current_album_art = None
+        _art_pixel_cache = None
+
 
 async def album_art_task(url, x, y):
     """Download album art, decode to 80×80 pixel cache (PNG) or decode JPEG directly."""
     global album_art_state, current_album_art, current_album_art_url, album_art_url
-    global _art_pixel_cache
+    global _art_pixel_cache, _album_art_task_handle
     album_art_state = ALBUM_ART_DOWNLOADING
     try:
         import os
+        t_art = time.ticks_ms()
+        print(f"Art: download start")
         try:
             os.remove('/album_art.jpg')
         except:
             pass
         status = await async_request_to_file(url, get_ha_headers(), '/album_art.jpg')
+        print(f"Art: download done status={status} t={time.ticks_diff(time.ticks_ms(),t_art)}ms")
         if status == 200:
+            import os as _os
+            fsize = _os.stat('/album_art.jpg')[6]
+            print(f"Art: file size={fsize} bytes")
             with open('/album_art.jpg', 'rb') as f:
                 magic = f.read(4)
+            print(f"Art: magic={magic}")
             if magic[:4] == b'\x89PNG':
+                # Switch to DECODING so state_poll_task resumes (HTTP is now free)
+                album_art_state = ALBUM_ART_DECODING
                 # Decode PNG to 80×80 pixel cache — full-image scaling, no crop
-                cache = png_decode_thumbnail('/album_art.jpg', 80, 80)
+                t_dec = time.ticks_ms()
+                cache = await png_decode_thumbnail('/album_art.jpg', 80, 80)
+                print(f"Art: png_decode returned {'bytes' if cache else 'None'} t={time.ticks_diff(time.ticks_ms(),t_dec)}ms")
                 if cache is None:
                     print("PNG thumbnail decode failed")
                     album_art_state = ALBUM_ART_IDLE
@@ -748,8 +789,27 @@ async def album_art_task(url, x, y):
                 display_lock.acquire()
                 try:
                     jpeg.open_file('/album_art.jpg')
-                    jpeg.decode(x, y, jpegdec.JPEG_SCALE_EIGHTH)
-                    current_album_art = (x, y, jpegdec.JPEG_SCALE_EIGHTH, 'jpeg')
+                    # Pick scale to produce ~80px output. Use get_width() where
+                    # available, fall back to file-size proxy (~400 bytes/px).
+                    try:
+                        src_w = jpeg.get_width()
+                    except AttributeError:
+                        src_w = fsize // 400
+                    if src_w >= 640:
+                        scale = jpegdec.JPEG_SCALE_EIGHTH
+                    elif src_w >= 320:
+                        scale = getattr(jpegdec, 'JPEG_SCALE_QUARTER', 2)
+                    elif src_w >= 160:
+                        scale = jpegdec.JPEG_SCALE_HALF
+                    else:
+                        scale = 0  # JPEG_SCALE_FULL — source already small
+                    print(f"Art: JPEG src_w={src_w} scale={scale}")
+                    display.set_pen(BLACK)
+                    display.rectangle(x, y, 80, 80)
+                    display.set_clip(x, y, 80, 80)
+                    jpeg.decode(x, y, scale)
+                    display.remove_clip()
+                    current_album_art = (x, y, scale, 'jpeg')
                     current_album_art_url = url
                     album_art_state = ALBUM_ART_READY
                     display.update()
@@ -767,6 +827,10 @@ async def album_art_task(url, x, y):
     except Exception as e:
         print(f"Error in album_art_task: {e}")
         album_art_state = ALBUM_ART_IDLE
+        current_album_art = None
+        _art_pixel_cache = None
+    finally:
+        _album_art_task_handle = None
 
 # ---------------------------------------------------------------------------
 # Drawing helpers (unchanged)
@@ -839,7 +903,7 @@ def draw_button_labels(force_update=False):
 def draw_screen(state_data):
     """Draw the main screen with the provided state data"""
     global album_art_loading, current_state_data, album_art_state, current_album_art_url
-    global current_album_name, current_album_art
+    global current_album_name, current_album_art, _album_art_task_handle
 
     display_lock.acquire()
     try:
@@ -964,13 +1028,15 @@ def draw_screen(state_data):
 
                 # If we have a new URL, start the download as an async task
                 if album_art_url:
-                    asyncio.create_task(album_art_task(album_art_url, 20, 40))
+                    _cancel_album_art()
+                    _album_art_task_handle = asyncio.create_task(album_art_task(album_art_url, 20, 40))
             elif album_art_state == ALBUM_ART_IDLE and album_art_url and not current_album_art:
                 # No album change but we need to load art
-                asyncio.create_task(album_art_task(album_art_url, 20, 40))
+                _cancel_album_art()
+                _album_art_task_handle = asyncio.create_task(album_art_task(album_art_url, 20, 40))
 
         # Draw placeholder or current album art
-        if album_art_state == ALBUM_ART_DOWNLOADING:
+        if album_art_state in (ALBUM_ART_DOWNLOADING, ALBUM_ART_DECODING):
             # Draw loading placeholder
             display.set_pen(GRAY)
             display.rectangle(20, 40, 80, 80)  # This is our reference position
@@ -989,8 +1055,11 @@ def draw_screen(state_data):
                     _draw_art_cache(x, y, scale, scale)
                 else:
                     jpeg.open_file('/album_art.jpg')
+                    display.set_clip(x, y, 80, 80)
                     jpeg.decode(x, y, scale)
+                    display.remove_clip()
             except Exception as e:
+                display.remove_clip()
                 print(f"Error drawing album art: {e}")
                 album_art_state = ALBUM_ART_IDLE
                 current_album_art = None
@@ -1037,7 +1106,7 @@ def draw_screen_smart(state_data, old_visible, new_visible):
     """Zone-based redraw: only repaint changed regions without display.clear().
     Preserves unchanged zones (e.g. album art) in the framebuffer between updates."""
     global current_state_data, album_art_state, current_album_art_url
-    global current_album_name, current_album_art
+    global current_album_name, current_album_art, _album_art_task_handle
 
     display_lock.acquire()
     try:
@@ -1131,9 +1200,11 @@ def draw_screen_smart(state_data, old_visible, new_visible):
                 text = "Loading..."
                 display.text(text, 20 + (80 - len(text)*6)//2 + 2, 40 + (80-8)//2, scale=1)
                 if album_art_url:
-                    asyncio.create_task(album_art_task(album_art_url, 20, 40))
+                    _cancel_album_art()
+                    _album_art_task_handle = asyncio.create_task(album_art_task(album_art_url, 20, 40))
             elif album_art_state == ALBUM_ART_IDLE and album_art_url and not current_album_art:
-                asyncio.create_task(album_art_task(album_art_url, 20, 40))
+                _cancel_album_art()
+                _album_art_task_handle = asyncio.create_task(album_art_task(album_art_url, 20, 40))
 
         # Volume zone: volume_level[4] changed
         if new_visible[4] != old_visible[4]:
@@ -1685,6 +1756,10 @@ async def state_poll_task():
         if is_sleeping or in_menu or in_speaker_select or in_brightness_screen:
             prev_visible = None
             continue
+        # Album art is downloading/decoding — skip this poll to avoid a second
+        # concurrent HTTP connection overwhelming the CYW43 WiFi chip.
+        if album_art_state == ALBUM_ART_DOWNLOADING:
+            continue
         new_state = await get_sonos_state_async()
         if new_state:
             new_visible = visible_state(new_state)
@@ -1782,12 +1857,16 @@ async def button_action_loop():
             await asyncio.sleep(0.1)
             continue
 
-        collect_garbage()
+        # Skip GC during album art download/decode — collect_garbage() takes ~40ms
+        # and runs on every asyncio yield, adding ~16s to a 400-row decode.
+        if album_art_state not in (ALBUM_ART_DOWNLOADING, ALBUM_ART_DECODING):
+            collect_garbage()
 
         # Button B: menu/back (short) or previous track (long, main screen only)
         if button_b_long_pending and not in_menu and not in_speaker_select and not in_brightness_screen:
             button_b_long_pending = False
             update_activity()
+            _cancel_album_art()
             await call_ha_service_async("media_previous_track", {"entity_id": current_speaker})
         elif button_b_short_pending:
             button_b_short_pending = False
@@ -1859,6 +1938,7 @@ async def button_action_loop():
             if button_a_long_pending:
                 button_a_long_pending = False
                 update_activity()
+                _cancel_album_art()
                 await call_ha_service_async("media_next_track", {"entity_id": current_speaker})
             elif button_a_short_pending:
                 button_a_short_pending = False
