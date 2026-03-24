@@ -81,6 +81,8 @@ in_menu = False
 # Sleep mode constants
 SLEEP_TIMEOUT = 60  # Time in seconds before sleep mode activates
 LED_PULSE_INTERVAL = 2  # Time in seconds between LED pulses
+LED_GREEN_ACTIVE = 3    # Green brightness when awake (0-255)
+LED_GREEN_SLEEP = 1     # Green brightness during sleep pulse (0-255)
 last_activity_time = 0
 is_sleeping = False
 
@@ -1278,7 +1280,7 @@ def connect_wifi():
         print("WiFi connection failed")
         return False
 
-    led.set_rgb(0, 16, 0)  # Green for connected
+    led.set_rgb(0, LED_GREEN_ACTIVE, 0)  # Green for connected
     wifi_connected = True
     print("WiFi connected successfully")
     return True
@@ -1401,7 +1403,7 @@ async def wake_device_async():
     is_sleeping = False
     last_activity_time = time.time()
     display.set_backlight(current_brightness)  # Use saved brightness
-    led.set_rgb(0, 16, 0)
+    led.set_rgb(0, LED_GREEN_ACTIVE, 0)
 
     # Redraw the appropriate screen
     if in_speaker_select:
@@ -1423,7 +1425,7 @@ async def wake_device_async():
 def pulse_led():
     """Simple blink in sleep mode — 1s on, 1s off cycle"""
     if (time.ticks_ms() // 1000) % 2 == 0:
-        led.set_rgb(0, 16, 0)
+        led.set_rgb(0, LED_GREEN_SLEEP, 0)
     else:
         led.set_rgb(0, 0, 0)
 
@@ -2015,7 +2017,7 @@ async def async_main():
     # Check initial WiFi status and set LED accordingly
     wlan = network.WLAN(network.STA_IF)
     if wlan.isconnected():
-        led.set_rgb(0, 16, 0)  # Green if already connected
+        led.set_rgb(0, LED_GREEN_ACTIVE, 0)  # Green if already connected
     else:
         led.set_rgb(16, 0, 0)  # Red if not connected yet
         # Try to connect to WiFi
