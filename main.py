@@ -527,8 +527,6 @@ async def png_decode_thumbnail(path, out_w=80, out_h=80):
         print("PNG decode: deflate module not available")
         return None
     gc.collect()
-    t0 = time.ticks_ms()
-    print(f"PNG decode start, free={gc.mem_free()}")
     f = None
     use_tmp = False
     try:
@@ -573,7 +571,6 @@ async def png_decode_thumbnail(path, out_w=80, out_h=80):
         if not idat_segs:
             print("PNG: no IDAT chunks found")
             return None
-        print(f"PNG {iw}x{ih} bpp={bpp} idat={len(idat_segs)} t={time.ticks_diff(time.ticks_ms(),t0)}ms")
 
         # Prepare the ZLIB source
         if len(idat_segs) == 1:
@@ -635,8 +632,6 @@ async def png_decode_thumbnail(path, out_w=80, out_h=80):
         acc = bytearray(out_w * 6)   # 3× uint16-LE per output pixel (R, G, B sums)
         out_y = 0
         row_in_box = 0
-        t_loop = time.ticks_ms()
-        print(f"PNG decode loop start t={time.ticks_diff(t_loop,t0)}ms")
         for src_y in range(ih):
             if out_y >= out_h:
                 break
@@ -669,15 +664,10 @@ async def png_decode_thumbnail(path, out_w=80, out_h=80):
                 out_y += 1
                 row_in_box = 0
             row, prev = prev, row
-            if src_y % 50 == 49:
-                print(f"PNG row {src_y+1}/{ih} t={time.ticks_diff(time.ticks_ms(),t_loop)}ms")
             if src_y % 5 == 4:
                 await asyncio.sleep(0)  # yield every 5 rows — buttons respond within ~200ms
-        total_ms = time.ticks_diff(time.ticks_ms(), t0)
         if out_y < out_h:
-            print(f"PNG: only decoded {out_y}/{out_h} rows in {total_ms}ms")
-        else:
-            print(f"PNG decode done: {out_y} rows in {total_ms}ms")
+            print(f"PNG: only decoded {out_y}/{out_h} rows")
         return out
     finally:
         # try/finally (no except) — required for await asyncio.sleep(0) to work
@@ -746,28 +736,21 @@ async def album_art_task(url, x, y):
     album_art_state = ALBUM_ART_DOWNLOADING
     try:
         import os
-        t_art = time.ticks_ms()
-        print(f"Art: download start")
         try:
             os.remove('/album_art.jpg')
         except:
             pass
         status = await async_request_to_file(url, get_ha_headers(), '/album_art.jpg')
-        print(f"Art: download done status={status} t={time.ticks_diff(time.ticks_ms(),t_art)}ms")
         if status == 200:
             import os as _os
             fsize = _os.stat('/album_art.jpg')[6]
-            print(f"Art: file size={fsize} bytes")
             with open('/album_art.jpg', 'rb') as f:
                 magic = f.read(4)
-            print(f"Art: magic={magic}")
             if magic[:4] == b'\x89PNG':
                 # Switch to DECODING so state_poll_task resumes (HTTP is now free)
                 album_art_state = ALBUM_ART_DECODING
                 # Decode PNG to 80×80 pixel cache — full-image scaling, no crop
-                t_dec = time.ticks_ms()
                 cache = await png_decode_thumbnail('/album_art.jpg', 80, 80)
-                print(f"Art: png_decode returned {'bytes' if cache else 'None'} t={time.ticks_diff(time.ticks_ms(),t_dec)}ms")
                 if cache is None:
                     print("PNG thumbnail decode failed")
                     album_art_state = ALBUM_ART_IDLE
@@ -805,7 +788,6 @@ async def album_art_task(url, x, y):
                         scale = jpegdec.JPEG_SCALE_HALF
                     else:
                         scale = 0  # JPEG_SCALE_FULL — source already small
-                    print(f"Art: JPEG src_w={src_w} scale={scale}")
                     display.set_pen(BLACK)
                     display.rectangle(x, y, 80, 80)
                     display.set_clip(x, y, 80, 80)
