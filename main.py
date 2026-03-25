@@ -115,6 +115,7 @@ current_album_name = None  # Track current album name
 # state constants
 last_state_update = 0
 state_update_interval = 1.0  # Poll interval for state_poll_task
+force_state_poll = False      # set True after next/prev to skip sleep and force immediate poll
 
 # Speaker constants
 available_speakers = []
@@ -232,30 +233,36 @@ async def async_request_to_file(url, headers, filename):
     req += '\r\n'
 
     reader, writer = await asyncio.open_connection(host, port)
-    writer.write(req.encode())
-    await writer.drain()
+    try:
+        writer.write(req.encode())
+        await writer.drain()
 
-    # Read status line
-    status_line = await reader.readline()
-    status_code = int(status_line.decode().split(' ')[1])
+        # Read status line
+        status_line = await reader.readline()
+        status_code = int(status_line.decode().split(' ')[1])
 
-    # Skip remaining headers
-    while True:
-        line = await reader.readline()
-        if line in (b'\r\n', b'', b'\n'):
-            break
-
-    with open(filename, 'wb') as f:
+        # Skip remaining headers
         while True:
-            chunk = await reader.read(4096)
-            if not chunk:
+            line = await reader.readline()
+            if line in (b'\r\n', b'', b'\n'):
                 break
-            f.write(chunk)
-            await asyncio.sleep(0)
 
-    writer.close()
-    collect_garbage()
-    return status_code
+        with open(filename, 'wb') as f:
+            while True:
+                chunk = await reader.read(4096)
+                if not chunk:
+                    break
+                f.write(chunk)
+                await asyncio.sleep(0)
+
+        collect_garbage()
+        return status_code
+    finally:
+        # Always close the socket — including on CancelledError — to free the
+        # CYW43 socket slot.  Without this, a cancelled mid-download leaves a
+        # leaked TCP connection that blocks subsequent open_connection() calls
+        # for several seconds.
+        writer.close()
 
 # ---------------------------------------------------------------------------
 # Async HA functions
@@ -715,18 +722,19 @@ def _draw_art_cache(x, y, w, h):
 
 def _cancel_album_art():
     """Cancel any in-progress album art download/decode and reset state to IDLE.
-    Safe to call even when no task is running."""
-    global _album_art_task_handle, album_art_state, current_album_art, _art_pixel_cache
+    Always clears current art — safe to call in any state, including READY."""
+    global _album_art_task_handle, album_art_state, current_album_art
+    global current_album_art_url, _art_pixel_cache
     if _album_art_task_handle is not None:
         try:
             _album_art_task_handle.cancel()
         except:
             pass
         _album_art_task_handle = None
-    if album_art_state in (ALBUM_ART_DOWNLOADING, ALBUM_ART_DECODING):
-        album_art_state = ALBUM_ART_IDLE
-        current_album_art = None
-        _art_pixel_cache = None
+    album_art_state = ALBUM_ART_IDLE
+    current_album_art = None
+    current_album_art_url = None
+    _art_pixel_cache = None
 
 
 async def album_art_task(url, x, y):
@@ -793,10 +801,15 @@ async def album_art_task(url, x, y):
                     display.set_clip(x, y, 80, 80)
                     jpeg.decode(x, y, scale)
                     display.remove_clip()
-                    current_album_art = (x, y, scale, 'jpeg')
-                    current_album_art_url = url
-                    album_art_state = ALBUM_ART_READY
-                    display.update()
+                    if album_art_state == ALBUM_ART_DOWNLOADING:  # not cancelled during decode
+                        current_album_art = (x, y, scale, 'jpeg')
+                        current_album_art_url = url
+                        album_art_state = ALBUM_ART_READY
+                        display.update()
+                    else:
+                        # Cancelled while jpeg.decode() was running — clear the painted area
+                        display.set_pen(BLACK)
+                        display.rectangle(x, y, 80, 80)
                 except Exception as e:
                     print(f"Album art decode error: {e}")
                     album_art_state = ALBUM_ART_IDLE
@@ -1736,10 +1749,16 @@ def visible_state(state_data):
     )
 
 async def state_poll_task():
-    global last_state_update, current_state_data
+    global last_state_update, current_state_data, force_state_poll
     prev_visible = None
+    elapsed = 0.0
     while True:
-        await asyncio.sleep(state_update_interval)
+        await asyncio.sleep(0.1)
+        elapsed += 0.1
+        if not force_state_poll and elapsed < state_update_interval:
+            continue
+        force_state_poll = False  # clear flag; poll fires immediately, no stale-state side effects
+        elapsed = 0.0
         # Not on main screen — reset so next entry gets a full redraw
         if is_sleeping or in_menu or in_speaker_select or in_brightness_screen:
             prev_visible = None
@@ -1783,6 +1802,7 @@ async def button_action_loop():
     global last_x_repeat, last_y_repeat, current_state_data
     global in_menu, in_speaker_select, in_brightness_screen
     global any_button_pressed, is_sleeping, last_activity_time, core1_running
+    global force_state_poll
 
     while True:
         current_time = time.time()
@@ -1858,6 +1878,7 @@ async def button_action_loop():
             update_activity()
             _cancel_album_art()
             await call_ha_service_async("media_previous_track", {"entity_id": current_speaker})
+            force_state_poll = True
         elif button_b_short_pending:
             button_b_short_pending = False
             button_b_long_pending = False
@@ -1930,6 +1951,7 @@ async def button_action_loop():
                 update_activity()
                 _cancel_album_art()
                 await call_ha_service_async("media_next_track", {"entity_id": current_speaker})
+                force_state_poll = True
             elif button_a_short_pending:
                 button_a_short_pending = False
                 update_activity()
