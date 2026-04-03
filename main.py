@@ -1412,10 +1412,21 @@ async def wake_device_async():
     elif in_menu:
         draw_menu()
     else:
-        new_state = await get_sonos_state_async()
-        if new_state:
-            current_state_data = new_state
-            draw_screen(new_state)
+        # Draw cached state immediately so the screen comes back without delay.
+        # Don't wait for the HA fetch before showing something on screen.
+        if current_state_data:
+            draw_screen(current_state_data)
+        else:
+            show_loading_screen("Waking...")
+        # Refresh from HA with a timeout so a slow/hung network can't freeze the
+        # device indefinitely. state_poll_task will retry on its normal interval.
+        try:
+            new_state = await asyncio.wait_for(get_sonos_state_async(), 8)
+            if new_state:
+                current_state_data = new_state
+                draw_screen(new_state)
+        except asyncio.TimeoutError:
+            pass  # Keep showing cached state; state_poll_task will refresh shortly
 
 # ---------------------------------------------------------------------------
 # Unchanged helper functions
@@ -1815,7 +1826,8 @@ async def button_action_loop():
 
             # Apply low power settings
             wlan = network.WLAN(network.STA_IF)
-            wlan.config(pm=0xa11c82)  # aggressive WiFi power save
+            wlan.config(pm=0xa11142)  # standard WiFi power save (aggressive mode
+                                      # causes AP de-auth after long sleeps)
             original_freq = machine.freq()
             machine.freq(48_000_000)  # reduce CPU from 150MHz to 48MHz
 
@@ -1849,6 +1861,12 @@ async def button_action_loop():
             button_x_tap_pending = False
             button_y_tap_pending = False
             any_button_pressed = False
+
+            # Reconnect WiFi if it dropped during sleep (synchronous, safe here
+            # because asyncio is still blocked until we reach the next await).
+            if not wlan.isconnected():
+                show_loading_screen("Reconnecting WiFi...")
+                connect_wifi()
 
             # Restart Core 1
             core1_running = True
