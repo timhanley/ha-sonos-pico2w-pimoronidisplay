@@ -1412,21 +1412,15 @@ async def wake_device_async():
     elif in_menu:
         draw_menu()
     else:
-        # Draw cached state immediately so the screen comes back without delay.
-        # Don't wait for the HA fetch before showing something on screen.
+        # Draw cached state immediately — no network calls here.
+        # asyncio.open_connection() can block the MicroPython interpreter at the
+        # C/CYW43 level if the WiFi stack is still recovering, making wait_for()
+        # ineffective and freezing the device. state_poll_task will fetch fresh
+        # state within state_update_interval (1 s) once asyncio is running.
         if current_state_data:
             draw_screen(current_state_data)
         else:
             show_loading_screen("Waking...")
-        # Refresh from HA with a timeout so a slow/hung network can't freeze the
-        # device indefinitely. state_poll_task will retry on its normal interval.
-        try:
-            new_state = await asyncio.wait_for(get_sonos_state_async(), 8)
-            if new_state:
-                current_state_data = new_state
-                draw_screen(new_state)
-        except asyncio.TimeoutError:
-            pass  # Keep showing cached state; state_poll_task will refresh shortly
 
 # ---------------------------------------------------------------------------
 # Unchanged helper functions
@@ -1835,9 +1829,13 @@ async def button_action_loop():
             # time.sleep_ms used instead of machine.lightsleep: lightsleep pauses
             # the PWM timer that drives the RGB LED, causing erratic flickering.
             # Power saving from 48MHz CPU + aggressive WiFi PM is still active.
+            # Poll every 50ms (not 200ms) so brief taps are reliably detected.
+            _wake_poll = 0
             while is_sleeping:
-                time.sleep_ms(200)
-                pulse_led()
+                time.sleep_ms(50)
+                _wake_poll += 1
+                if _wake_poll % 4 == 0:   # pulse LED at the same 200ms cadence
+                    pulse_led()
                 if (button_a.value() == 0 or button_b.value() == 0 or
                         button_x.value() == 0 or button_y.value() == 0):
                     break  # wake on any button press
@@ -1845,6 +1843,11 @@ async def button_action_loop():
             # Restore power settings
             machine.freq(original_freq)
             wlan.config(pm=0xa11142)  # restore default WiFi power save
+
+            # Turn the screen and LED on immediately so the user gets visual
+            # feedback at once — before any (potentially slow) network activity.
+            display.set_backlight(current_brightness)
+            led.set_rgb(0, LED_GREEN_ACTIVE, 0)
 
             # Wait for the wake button to be fully released before restarting
             # Core 1 — otherwise Core 1 catches the release and fires the action.
@@ -1862,11 +1865,16 @@ async def button_action_loop():
             button_y_tap_pending = False
             any_button_pressed = False
 
-            # Reconnect WiFi if it dropped during sleep (synchronous, safe here
-            # because asyncio is still blocked until we reach the next await).
+            # Reconnect WiFi if it dropped during sleep.
+            # Force a full CYW43 chip reset (active False→True) to clear stale
+            # TCP socket state that accumulates during long sleeps — without this,
+            # new connections can hang indefinitely inside the driver.
             if not wlan.isconnected():
                 show_loading_screen("Reconnecting WiFi...")
+                wlan.active(False)
+                time.sleep_ms(300)
                 connect_wifi()
+                time.sleep_ms(500)  # let the stack stabilise before asyncio resumes
 
             # Restart Core 1
             core1_running = True
