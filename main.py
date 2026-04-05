@@ -83,8 +83,9 @@ SLEEP_TIMEOUT = 60  # Time in seconds before sleep mode activates
 LED_PULSE_INTERVAL = 2  # Time in seconds between LED pulses
 LED_GREEN_ACTIVE = 3    # Green brightness when awake (0-255)
 LED_GREEN_SLEEP = 1     # Green brightness during sleep pulse (0-255)
-WIFI_RESET_THRESHOLD = 300  # seconds asleep before a full CYW43 chip reset is needed
-                             # (APs typically de-auth after several minutes of inactivity)
+WIFI_RESET_THRESHOLD = 3540  # seconds asleep before a full CYW43 chip reset is needed
+                             # (APs typically de-auth after ~60 min of inactivity)
+                             # Default: 3540 s (59 min) — see README for tuning guidance
 last_activity_time = 0
 is_sleeping = False
 sleep_start_time = 0    # time.time() when we entered sleep — used to decide reconnect strategy

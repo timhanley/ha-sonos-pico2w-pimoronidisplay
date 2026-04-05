@@ -55,6 +55,25 @@ A MicroPython application for controlling Sonos speakers via Home Assistant usin
 - Button X: Volume Up / Menu Up
 - Button Y: Volume Down / Menu Down
 
+## Configuration
+
+Several constants near the top of `main.py` can be adjusted to tune behaviour:
+
+| Constant | Default | Description |
+|---|---|---|
+| `SLEEP_TIMEOUT` | `60` | Seconds of inactivity before the display sleeps |
+| `WIFI_RESET_THRESHOLD` | `3540` | See below |
+| `MIN_BRIGHTNESS` | `0.25` | Minimum brightness (0.0–1.0) reachable via the Brightness menu |
+
+### `WIFI_RESET_THRESHOLD` — WiFi reconnect strategy on wake
+
+When the device wakes from sleep it needs to decide how aggressively to restore the WiFi connection:
+
+- **Short sleep** (slept for less than `WIFI_RESET_THRESHOLD` seconds): the device checks whether it is still associated with the router. If it is, no reconnect is needed at all and the wake is instant. If it isn't, it reconnects quickly using the saved AP address (skipping a channel scan).
+- **Long sleep** (slept for `WIFI_RESET_THRESHOLD` seconds or more): the device performs a full WiFi chip reset before reconnecting. This is necessary because most routers silently drop idle clients after a period of inactivity, but the Pico W's driver continues to report "connected" — causing any network request to hang for up to 60 seconds. The chip reset clears that stale state reliably.
+
+The default of **3540 seconds (59 minutes)** matches the typical router idle-client timeout of 60 minutes. If your router de-authenticates clients sooner (e.g. after 5 minutes), reduce this value accordingly. If your router never drops idle clients, you can raise it or set it higher than any realistic sleep duration to disable the slow reset path entirely.
+
 ## License
 
 This project is licensed under a custom non-commercial license. See the LICENSE file for details.
