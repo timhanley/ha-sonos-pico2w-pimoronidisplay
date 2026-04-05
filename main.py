@@ -83,8 +83,12 @@ SLEEP_TIMEOUT = 60  # Time in seconds before sleep mode activates
 LED_PULSE_INTERVAL = 2  # Time in seconds between LED pulses
 LED_GREEN_ACTIVE = 3    # Green brightness when awake (0-255)
 LED_GREEN_SLEEP = 1     # Green brightness during sleep pulse (0-255)
+WIFI_RESET_THRESHOLD = 300  # seconds asleep before a full CYW43 chip reset is needed
+                             # (APs typically de-auth after several minutes of inactivity)
 last_activity_time = 0
 is_sleeping = False
+sleep_start_time = 0    # time.time() when we entered sleep — used to decide reconnect strategy
+_saved_ap_bssid = None  # AP BSSID saved on sleep entry for targeted fast reconnect
 
 # Constants for album art states
 ALBUM_ART_IDLE = 0
@@ -1247,7 +1251,9 @@ def show_message(message, scale=2):
     finally:
         display_lock.release()
 
-def connect_wifi():
+def connect_wifi(bssid=None):
+    """Connect to WiFi. Pass bssid (bytes) for a faster targeted reconnect that
+    skips AP scanning — only use when the chip has NOT been reset (active(False))."""
     global wifi_connected
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
@@ -1261,7 +1267,10 @@ def connect_wifi():
     show_message("Connecting to WiFi...")
     print("Connecting to WiFi...")
 
-    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+    if bssid:
+        wlan.connect(WIFI_SSID, WIFI_PASSWORD, bssid=bssid)  # skip scan, connect direct
+    else:
+        wlan.connect(WIFI_SSID, WIFI_PASSWORD)
 
     # Wait for connection with timeout
     max_wait = 10
@@ -1435,8 +1444,14 @@ def pulse_led():
 
 def enter_sleep_mode():
     """Enter low power sleep mode"""
-    global is_sleeping
+    global is_sleeping, sleep_start_time, _saved_ap_bssid
     is_sleeping = True
+    sleep_start_time = time.time()
+    # Save the AP BSSID so we can reconnect directly (skip scanning) on short wakes.
+    try:
+        _saved_ap_bssid = network.WLAN(network.STA_IF).config('bssid')
+    except:
+        _saved_ap_bssid = None
     display.set_backlight(0)
     display_lock.acquire()
     try:
@@ -1865,17 +1880,27 @@ async def button_action_loop():
             button_y_tap_pending = False
             any_button_pressed = False
 
-            # Always do a full CYW43 chip reset on wake — do NOT rely on
-            # wlan.isconnected().  After a long sleep the AP silently de-auths
-            # the device, but the driver still returns isconnected() == True.
-            # Any subsequent asyncio.open_connection() then blocks at the C level
-            # inside the driver for up to 60+ seconds, freezing all asyncio tasks.
-            # A chip reset + reconnect takes ~2–3 s and is always reliable.
-            show_loading_screen("Reconnecting WiFi...")
-            wlan.active(False)
-            time.sleep_ms(500)
-            connect_wifi()
-            time.sleep_ms(500)  # let the TCP stack stabilise before asyncio resumes
+            # Choose reconnect strategy based on how long we were asleep.
+            # APs de-auth idle devices after several minutes; the CYW43 driver
+            # keeps reporting isconnected()==True regardless, so we cannot trust it.
+            # Strategy:
+            #   short sleep (< WIFI_RESET_THRESHOLD): skip chip reset — just
+            #     reconnect directly to the saved BSSID (skips AP scan, ~1-2 s
+            #     faster). If already still connected, skip entirely.
+            #   long sleep (>= WIFI_RESET_THRESHOLD): full chip reset to clear
+            #     stale TCP socket state, then normal reconnect (~2-3 s).
+            sleep_duration = time.time() - sleep_start_time
+            if sleep_duration >= WIFI_RESET_THRESHOLD:
+                show_loading_screen("Reconnecting WiFi...")
+                wlan.active(False)
+                time.sleep_ms(500)
+                connect_wifi()  # full reset — don't pass bssid, chip state was wiped
+                time.sleep_ms(500)  # let the TCP stack stabilise
+            elif not wlan.isconnected():
+                show_loading_screen("Reconnecting WiFi...")
+                connect_wifi(bssid=_saved_ap_bssid)  # fast: target AP directly, skip scan
+                time.sleep_ms(200)  # brief settle
+            # else: still connected (short sleep) — no reconnect needed at all
 
             # Restart Core 1
             core1_running = True
