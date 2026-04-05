@@ -1865,16 +1865,17 @@ async def button_action_loop():
             button_y_tap_pending = False
             any_button_pressed = False
 
-            # Reconnect WiFi if it dropped during sleep.
-            # Force a full CYW43 chip reset (active False→True) to clear stale
-            # TCP socket state that accumulates during long sleeps — without this,
-            # new connections can hang indefinitely inside the driver.
-            if not wlan.isconnected():
-                show_loading_screen("Reconnecting WiFi...")
-                wlan.active(False)
-                time.sleep_ms(300)
-                connect_wifi()
-                time.sleep_ms(500)  # let the stack stabilise before asyncio resumes
+            # Always do a full CYW43 chip reset on wake — do NOT rely on
+            # wlan.isconnected().  After a long sleep the AP silently de-auths
+            # the device, but the driver still returns isconnected() == True.
+            # Any subsequent asyncio.open_connection() then blocks at the C level
+            # inside the driver for up to 60+ seconds, freezing all asyncio tasks.
+            # A chip reset + reconnect takes ~2–3 s and is always reliable.
+            show_loading_screen("Reconnecting WiFi...")
+            wlan.active(False)
+            time.sleep_ms(500)
+            connect_wifi()
+            time.sleep_ms(500)  # let the TCP stack stabilise before asyncio resumes
 
             # Restart Core 1
             core1_running = True
