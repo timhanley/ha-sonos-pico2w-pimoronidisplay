@@ -59,6 +59,8 @@ wifi_check_interval = 30
 # Add connection state tracking
 wifi_connected = False
 ha_connected = False
+wake_cycle_count = 0
+
 
 # Initialize button press tracking
 last_button_a_press = 0
@@ -79,17 +81,15 @@ current_menu_index = 0
 in_menu = False
 
 # Sleep mode constants
-SLEEP_TIMEOUT = 60  # Time in seconds before sleep mode activates
+SCREEN_SLEEP_TIMEOUT = 60   # Seconds of inactivity before blanking the screen (WiFi stays on)
+DEEP_SLEEP_TIMEOUT = 3600   # Seconds of inactivity before deep sleep (WiFi off, reconnect on wake)
 LED_PULSE_INTERVAL = 2  # Time in seconds between LED pulses
 LED_GREEN_ACTIVE = 3    # Green brightness when awake (0-255)
 LED_GREEN_SLEEP = 1     # Green brightness during sleep pulse (0-255)
-WIFI_RESET_THRESHOLD = 3540  # seconds asleep before a full CYW43 chip reset is needed
-                             # (APs typically de-auth after ~60 min of inactivity)
-                             # Default: 3540 s (59 min) — see README for tuning guidance
 last_activity_time = 0
-is_sleeping = False
-sleep_start_time = 0    # time.time() when we entered sleep — used to decide reconnect strategy
-_saved_ap_bssid = None  # AP BSSID saved on sleep entry for targeted fast reconnect
+is_screen_sleeping = False  # Screen off, WiFi alive, asyncio running — instant wake
+is_sleeping = False         # Deep sleep — WiFi off, asyncio blocked, reconnect on wake
+sleep_start_time = 0        # time.time() when we entered deep sleep
 
 # Constants for album art states
 ALBUM_ART_IDLE = 0
@@ -275,7 +275,9 @@ async def async_request_to_file(url, headers, filename):
 
 async def get_sonos_state_async():
     global ha_connected
-    if not check_wifi_connection() or not current_speaker:
+    if not current_speaker:
+        return None
+    if not check_wifi_connection():
         return None
     try:
         status, data = await async_request('GET', f'{HA_URL}/api/states/{current_speaker}', get_ha_headers())
@@ -284,7 +286,7 @@ async def get_sonos_state_async():
             return data
         ha_connected = False
         return None
-    except:
+    except Exception as e:
         ha_connected = False
         return None
 
@@ -309,7 +311,7 @@ async def call_ha_service_async(service, data):
                 display.update()
             finally:
                 display_lock.release()
-        except:
+        except Exception as e:
             display_lock.acquire()
             try:
                 display.set_pen(BLACK)
@@ -1252,9 +1254,8 @@ def show_message(message, scale=2):
     finally:
         display_lock.release()
 
-def connect_wifi(bssid=None):
-    """Connect to WiFi. Pass bssid (bytes) for a faster targeted reconnect that
-    skips AP scanning — only use when the chip has NOT been reset (active(False))."""
+def connect_wifi():
+    """Connect to WiFi with a clean chip start (active(True) + connect)."""
     global wifi_connected
     wlan = network.WLAN(network.STA_IF)
     wlan.active(True)
@@ -1268,10 +1269,7 @@ def connect_wifi(bssid=None):
     show_message("Connecting to WiFi...")
     print("Connecting to WiFi...")
 
-    if bssid:
-        wlan.connect(WIFI_SSID, WIFI_PASSWORD, bssid=bssid)  # skip scan, connect direct
-    else:
-        wlan.connect(WIFI_SSID, WIFI_PASSWORD)
+    wlan.connect(WIFI_SSID, WIFI_PASSWORD)
 
     # Wait for connection with timeout
     max_wait = 10
@@ -1279,19 +1277,16 @@ def connect_wifi(bssid=None):
         if wlan.status() < 0 or wlan.status() >= 3:
             break
         max_wait -= 1
-        print("Waiting for WiFi connection...")
         time.sleep(1)
 
     if wlan.status() != 3:
         led.set_rgb(16, 0, 0)  # Red for failed connection, but dimmer
         wifi_connected = False
         show_message("WiFi Connection Failed")
-        print("WiFi connection failed")
         return False
 
     led.set_rgb(0, LED_GREEN_ACTIVE, 0)  # Green for connected
     wifi_connected = True
-    print("WiFi connected successfully")
     return True
 
 def check_wifi_connection():
@@ -1437,22 +1432,75 @@ async def wake_device_async():
 # ---------------------------------------------------------------------------
 
 def pulse_led():
-    """Simple blink in sleep mode — 1s on, 1s off cycle"""
+    """Blink LED during deep sleep — 2s on, 2s off (slow blink)."""
+    if (time.ticks_ms() // 2000) % 2 == 0:
+        led.set_rgb(0, LED_GREEN_SLEEP, 0)
+    else:
+        led.set_rgb(0, 0, 0)
+
+def pulse_led_screen_sleep():
+    """Blink LED during screen sleep — 1s on, 1s off (fast blink).
+    Faster cadence distinguishes screen sleep from deep sleep."""
     if (time.ticks_ms() // 1000) % 2 == 0:
         led.set_rgb(0, LED_GREEN_SLEEP, 0)
     else:
         led.set_rgb(0, 0, 0)
 
+def enter_screen_sleep():
+    """Blank the screen but keep WiFi and asyncio running.
+
+    This is the first tier of sleep — triggered after SCREEN_SLEEP_TIMEOUT
+    seconds of inactivity.  Any button press wakes the screen instantly with
+    no reconnect delay because WiFi stays connected and state_poll_task keeps
+    current_state_data fresh in the background."""
+    global is_screen_sleeping
+    is_screen_sleeping = True
+    display.set_backlight(0)
+    led.set_rgb(0, 0, 0)
+
+
+def wake_from_screen_sleep():
+    """Instant wake from screen sleep — just turn the display back on."""
+    global is_screen_sleeping, last_activity_time
+    is_screen_sleeping = False
+    last_activity_time = time.time()
+    display.set_backlight(current_brightness)
+    led.set_rgb(0, LED_GREEN_ACTIVE, 0)
+    # Draw current state immediately — it's been kept fresh by state_poll_task.
+    if in_speaker_select:
+        draw_speaker_select()
+    elif in_brightness_screen:
+        draw_brightness_screen()
+    elif in_menu:
+        draw_menu()
+    elif current_state_data:
+        draw_screen(current_state_data)
+    else:
+        show_loading_screen("Waking...")
+
+
 def enter_sleep_mode():
-    """Enter low power sleep mode"""
-    global is_sleeping, sleep_start_time, _saved_ap_bssid
+    """Enter deep sleep — WiFi off, CPU lowered, asyncio blocked.
+
+    This is the second tier of sleep — triggered after DEEP_SLEEP_TIMEOUT
+    seconds of total inactivity.  Deactivates the CYW43 WiFi chip to prevent
+    the SDIO transport stall that occurs during long idle periods.  Waking
+    from deep sleep requires a full WiFi reconnect (~3-5s)."""
+    global is_sleeping, is_screen_sleeping, sleep_start_time
+    global album_art_state, current_album_art, current_album_art_url, current_album_name
     is_sleeping = True
+    is_screen_sleeping = False  # clear screen sleep flag — we're going deeper
     sleep_start_time = time.time()
-    # Save the AP BSSID so we can reconnect directly (skip scanning) on short wakes.
-    try:
-        _saved_ap_bssid = network.WLAN(network.STA_IF).config('bssid')
-    except:
-        _saved_ap_bssid = None
+    # Deactivate WiFi — prevents CYW43 transport stall during deep sleep
+    wlan = network.WLAN(network.STA_IF)
+    wlan.active(False)
+    # Reset album art state so the first draw_screen() after wake triggers a
+    # fresh download instead of assuming the cached art is still current.
+    _cancel_album_art()
+    album_art_state = ALBUM_ART_IDLE
+    current_album_art = None
+    current_album_art_url = None
+    current_album_name = None
     display.set_backlight(0)
     display_lock.acquire()
     try:
@@ -1771,6 +1819,7 @@ def visible_state(state_data):
 
 async def state_poll_task():
     global last_state_update, current_state_data, force_state_poll
+    global pending_wake_reconnect_log, wake_state_poll_failures
     prev_visible = None
     elapsed = 0.0
     while True:
@@ -1783,6 +1832,15 @@ async def state_poll_task():
         # Not on main screen — reset so next entry gets a full redraw
         if is_sleeping or in_menu or in_speaker_select or in_brightness_screen:
             prev_visible = None
+            continue
+        # Screen sleeping — keep polling HA to maintain WiFi activity and
+        # fresh state, but skip all drawing and album art downloads.
+        if is_screen_sleeping:
+            new_state = await get_sonos_state_async()
+            if new_state:
+                current_state_data = new_state
+            prev_visible = None  # force full redraw on screen wake
+            last_state_update = time.time()
             continue
         # Album art is downloading/decoding — skip this poll to avoid a second
         # concurrent HTTP connection overwhelming the CYW43 WiFi chip.
@@ -1824,28 +1882,54 @@ async def button_action_loop():
     global in_menu, in_speaker_select, in_brightness_screen
     global any_button_pressed, is_sleeping, last_activity_time, core1_running
     global force_state_poll
+    global wake_cycle_count, pending_wake_reconnect_log, wake_state_poll_failures
+    global is_screen_sleeping
 
     while True:
         current_time = time.time()
 
-        # Handle sleep mode
+        # Wake from screen sleep on any button press — instant, no reconnect.
+        if is_screen_sleeping and not is_sleeping:
+            # Transition to deep sleep if idle long enough
+            idle_seconds = current_time - last_activity_time
+            if idle_seconds >= DEEP_SLEEP_TIMEOUT:
+                if album_art_state not in (ALBUM_ART_DOWNLOADING, ALBUM_ART_DECODING):
+                    enter_sleep_mode()
+                    await asyncio.sleep(0.1)
+                    continue
+            if (button_a_short_pending or button_a_long_pending or
+                    button_b_short_pending or button_b_long_pending or
+                    button_x_tap_pending or button_y_tap_pending):
+                wake_from_screen_sleep()
+                # Discard the wake press so it doesn't trigger an action
+                button_a_short_pending = False
+                button_a_long_pending = False
+                button_b_short_pending = False
+                button_b_long_pending = False
+                button_x_tap_pending = False
+                button_y_tap_pending = False
+                any_button_pressed = False
+                continue
+            pulse_led_screen_sleep()
+            await asyncio.sleep(0.02)
+            continue
+
+        # Handle deep sleep mode
         if is_sleeping:
             # Stop Core 1 so it doesn't conflict with lightsleep
             core1_running = False
             time.sleep(0.02)  # give Core 1 time to exit its 5ms polling loop
 
-            # Apply low power settings
-            wlan = network.WLAN(network.STA_IF)
-            wlan.config(pm=0xa11142)  # standard WiFi power save (aggressive mode
-                                      # causes AP de-auth after long sleeps)
+            # Apply low power settings — WiFi is already off (enter_sleep_mode
+            # called wlan.active(False)), so only the CPU clock needs lowering.
             original_freq = machine.freq()
             machine.freq(48_000_000)  # reduce CPU from 150MHz to 48MHz
 
-            # Sleep loop — blocks asyncio intentionally, nothing to do while asleep
+            # Sleep loop — blocks asyncio intentionally, nothing to do while asleep.
             # time.sleep_ms used instead of machine.lightsleep: lightsleep pauses
             # the PWM timer that drives the RGB LED, causing erratic flickering.
-            # Power saving from 48MHz CPU + aggressive WiFi PM is still active.
-            # Poll every 50ms (not 200ms) so brief taps are reliably detected.
+            # WiFi chip is already off; 48MHz CPU is our main power saving here.
+            # Poll every 50ms so brief taps are reliably detected.
             _wake_poll = 0
             while is_sleeping:
                 time.sleep_ms(50)
@@ -1856,9 +1940,11 @@ async def button_action_loop():
                         button_x.value() == 0 or button_y.value() == 0):
                     break  # wake on any button press
 
-            # Restore power settings
+            sleep_duration = time.time() - sleep_start_time
+            wake_cycle_count += 1
+
+            # Restore CPU clock
             machine.freq(original_freq)
-            wlan.config(pm=0xa11142)  # restore default WiFi power save
 
             # Turn the screen and LED on immediately so the user gets visual
             # feedback at once — before any (potentially slow) network activity.
@@ -1881,27 +1967,19 @@ async def button_action_loop():
             button_y_tap_pending = False
             any_button_pressed = False
 
-            # Choose reconnect strategy based on how long we were asleep.
-            # APs de-auth idle devices after several minutes; the CYW43 driver
-            # keeps reporting isconnected()==True regardless, so we cannot trust it.
-            # Strategy:
-            #   short sleep (< WIFI_RESET_THRESHOLD): skip chip reset — just
-            #     reconnect directly to the saved BSSID (skips AP scan, ~1-2 s
-            #     faster). If already still connected, skip entirely.
-            #   long sleep (>= WIFI_RESET_THRESHOLD): full chip reset to clear
-            #     stale TCP socket state, then normal reconnect (~2-3 s).
-            sleep_duration = time.time() - sleep_start_time
-            if sleep_duration >= WIFI_RESET_THRESHOLD:
-                show_loading_screen("Reconnecting WiFi...")
-                wlan.active(False)
-                time.sleep_ms(500)
-                connect_wifi()  # full reset — don't pass bssid, chip state was wiped
-                time.sleep_ms(500)  # let the TCP stack stabilise
-            elif not wlan.isconnected():
-                show_loading_screen("Reconnecting WiFi...")
-                connect_wifi(bssid=_saved_ap_bssid)  # fast: target AP directly, skip scan
-                time.sleep_ms(200)  # brief settle
-            # else: still connected (short sleep) — no reconnect needed at all
+            # Reconnect WiFi — chip was deactivated on sleep entry, so this
+            # is always a clean start from wlan.active(True) + wlan.connect().
+            # No strategy selection needed; the transport is guaranteed clean.
+            reconnect_ok = connect_wifi()
+            if not reconnect_ok:
+                # First attempt can fail if the AP is slow to respond after the
+                # chip was off for a long time.  One retry is usually enough.
+                time.sleep_ms(1000)
+                reconnect_ok = connect_wifi()
+            # Brief settle so the lwIP TCP stack is ready for the first HA poll.
+            # Without this, the immediate state_poll_task fires before ARP/routing
+            # is established, causing ECONNABORTED on the first request.
+            time.sleep_ms(500)
 
             # Restart Core 1
             core1_running = True
@@ -1912,13 +1990,20 @@ async def button_action_loop():
             await wake_device_async()
             continue
 
-        # Check sleep timeout — suppress while album art is loading so the decode
-        # isn't interrupted and left invisible behind a dark screen.
-        if (current_time - last_activity_time >= SLEEP_TIMEOUT and
-                album_art_state not in (ALBUM_ART_DOWNLOADING, ALBUM_ART_DECODING)):
-            enter_sleep_mode()
-            await asyncio.sleep(0.1)
-            continue
+        # Two-tier sleep: screen sleep (fast wake) then deep sleep (WiFi off).
+        idle_seconds = current_time - last_activity_time
+
+        # Deep sleep — WiFi off, reconnect on wake
+        if idle_seconds >= DEEP_SLEEP_TIMEOUT:
+            if album_art_state not in (ALBUM_ART_DOWNLOADING, ALBUM_ART_DECODING):
+                enter_sleep_mode()
+                await asyncio.sleep(0.1)
+                continue
+
+        # Screen sleep — display off, WiFi stays alive, instant wake
+        if not is_screen_sleeping and idle_seconds >= SCREEN_SLEEP_TIMEOUT:
+            if album_art_state not in (ALBUM_ART_DOWNLOADING, ALBUM_ART_DECODING):
+                enter_screen_sleep()
 
         # Skip GC during album art download/decode — collect_garbage() takes ~40ms
         # and runs on every asyncio yield, adding ~16s to a 400-row decode.
@@ -2049,6 +2134,7 @@ async def async_main():
     current_speaker = None
     in_speaker_select = False
     is_sleeping = False
+    is_screen_sleeping = False
     album_art_response = None
     current_menu_index = 0
     in_menu = False
