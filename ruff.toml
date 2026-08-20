@@ -1,0 +1,12 @@
+line-length = 100
+target-version = "py38"
+
+[lint]
+select = ["E", "F", "W"]
+
+[lint.per-file-ignores]
+# Viper-compiled functions use compile-time names (micropython, ptr8) that
+# only exist on-device.
+"app/pngthumb.py" = ["F821"]
+# The embedded HA Jinja template has long lines that must stay intact.
+"app/ha.py" = ["E501"]
