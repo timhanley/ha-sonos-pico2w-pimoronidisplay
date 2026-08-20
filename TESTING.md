@@ -101,18 +101,29 @@ Deep sleep (set `DEEP_SLEEP_TIMEOUT = 60` temporarily):
 - [ ] Rapid random button mashing across screens for a minute: no lockup, no
       tearing (display_lock scope), no missed/double actions
 
+## Already verified off-device
+
+`make test` runs the suite: CPython unit tests plus 38 checks under the real
+MicroPython interpreter (unix port 1.28, stubbed hardware) covering: all
+module imports, the `asyncio.wait_for(ThreadSafeFlag.wait())` pattern, the
+PNG decoder end-to-end on a fixture (including RGB565 byte order), art
+pipeline state transitions, button queue semantics, zone-diff rendering,
+menu/brightness/sleep-wake logic, and the HA template payloads.
+
 ## Known first-flash risk points
 
 If something breaks immediately, look here first and capture the console
 traceback:
 
-1. `asyncio.wait_for(ThreadSafeFlag.wait(), …)` in `app/app.py _wait_events`
-   — flag/timeout semantics across MicroPython versions.
-2. The `/api/template` state poll in `app/ha.py` — confirm the response
-   parses (needs HA's template API; check any 4xx in the console).
-3. `memoryview(display)` snapshot for JPEG art in `app/artwork.py` — if the
+1. The `/api/template` state poll in `app/ha.py` — confirm the response
+   parses against your HA version (check for 4xx in the console).
+2. `memoryview(display)` snapshot for JPEG art in `app/artwork.py` — if the
    firmware lacks the buffer protocol it should silently fall back to
    flash redraws ('jpeg_file' path), not crash.
+3. Anything RP2350-build-specific the unix port can't replicate: real Core 1
+   threading, the CYW43 WiFi paths, and deep-sleep wake. On boot the console
+   must NOT print "PNG: viper emitter unavailable" — the Pimoroni RP2350
+   build has viper, so that line appearing means the fast path regressed.
 
 When everything passes: update TESTING.md status below, then push and tag
 `v2.0.0`.

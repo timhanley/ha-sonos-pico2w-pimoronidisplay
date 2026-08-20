@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Lint
+        run: |
+          pip install ruff
+          ruff check .
+
+      - name: CPython unit tests
+        run: python -m unittest discover tests
+
+      - name: Cache MicroPython build
+        id: cache-mpy
+        uses: actions/cache@v4
+        with:
+          path: micropython-bin
+          key: micropython-unix-v1.28.0
+
+      - name: Build MicroPython unix port
+        if: steps.cache-mpy.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v1.28.0 https://github.com/micropython/micropython.git /tmp/mpy
+          make -C /tmp/mpy/mpy-cross -j"$(nproc)"
+          make -C /tmp/mpy/ports/unix submodules
+          make -C /tmp/mpy/ports/unix -j"$(nproc)"
+          mkdir -p micropython-bin
+          cp /tmp/mpy/ports/unix/build-standard/micropython micropython-bin/
+
+      - name: MicroPython tests (stubbed hardware)
+        run: MICROPYPATH="tests/mpy_stubs:.:.frozen" ./micropython-bin/micropython tests/mpy/run_tests.py

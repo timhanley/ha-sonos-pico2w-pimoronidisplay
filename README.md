@@ -49,7 +49,9 @@ app/
   buttons.py       Core 1 button polling + event queue
   power.py         Two-tier sleep manager
   artwork.py       Album art pipeline (download → decode → pixel cache)
-  pngthumb.py      Streaming PNG thumbnail decoder (viper-accelerated)
+  pngthumb.py      Streaming PNG thumbnail decoder
+  pngfilters_viper.py  Viper-accelerated PNG primitives (device fast path)
+  pngfilters.py    Pure-Python PNG primitives (reference + fallback)
   ha.py            Home Assistant REST client
   httpc.py         Minimal async HTTP client
   net.py           WiFi connection manager
@@ -117,11 +119,18 @@ When the device is awake the LED is solid green.
 ## Development
 
 ```
-make test     # CPython unit tests for the pure helpers
+make test     # CPython unit tests + MicroPython suite (if installed)
+make test-mpy # app modules under real MicroPython (unix port, stubbed hardware)
 make lint     # ruff
 make deploy   # copy code to the device
 make console  # serial REPL
 ```
+
+The MicroPython suite (`tests/mpy/run_tests.py`, `brew install micropython`)
+runs the actual app modules under the real MicroPython interpreter with
+stubbed hardware — it catches MicroPython-specific breakage before flashing.
+CI runs lint plus both suites on every push. `TESTING.md` documents the
+on-hardware test pass required before a release is trusted.
 
 ## License
 
