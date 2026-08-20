@@ -4,7 +4,11 @@
 #
 # Run from the repo root:  make test-mpy
 #   (MICROPYPATH="tests/mpy_stubs:." micropython tests/mpy/run_tests.py)
+import sys
+
 import asyncio
+
+sys.path.insert(0, "tests/mpy")  # for fake_ha
 
 _failures = []
 _count = 0
@@ -24,6 +28,7 @@ def test_imports():
     import app.artwork      # noqa: F401
     import app.buttons      # noqa: F401
     import app.ha           # noqa: F401
+    import app.hapush       # noqa: F401
     import app.httpc        # noqa: F401
     import app.hw           # noqa: F401
     import app.net          # noqa: F401
@@ -31,6 +36,7 @@ def test_imports():
     import app.power        # noqa: F401
     import app.screens      # noqa: F401
     import app.textutil     # noqa: F401
+    import app.wsclient     # noqa: F401
     check("all modules import under MicroPython", True)
 
 
@@ -222,10 +228,134 @@ def test_app_smoke():
     asyncio.run(run())
 
 
+def test_hapush_diff_merge():
+    # Pure diff-merge logic — no sockets.
+    from app.hapush import HAPush
+    push = HAPush()
+    changed = push._handle_event({"a": {"media_player.k": {
+        "s": "playing",
+        "a": {"media_artist": "A", "media_title": "T", "volume_level": 0.5,
+              "friendly_name": "K", "irrelevant_attr": 123}}}})
+    check("snapshot changed set", changed == {"media_player.k"})
+    st = push.states["media_player.k"]
+    check("snapshot mapped", st["state"] == "playing" and st["artist"] == "A"
+          and st["volume"] == 0.5 and st["picture"] is None)
+    check("irrelevant attrs dropped", "irrelevant_attr" not in st)
+
+    push._handle_event({"c": {"media_player.k": {"+": {"a": {"media_title": "T2"}}}}})
+    check("diff merges title", st["title"] == "T2" and st["artist"] == "A")
+    push._handle_event({"c": {"media_player.k": {
+        "+": {"s": "paused"}, "-": {"a": ["media_artist"]}}}})
+    check("diff state + removal", st["state"] == "paused" and st["artist"] is None)
+
+
+def test_websocket_end_to_end():
+    # Real TCP loopback: wsclient + hapush against a scripted RFC 6455 server.
+    from app.hapush import HAPush
+    from fake_ha import PORT, FakeHAServer
+
+    async def run():
+        server = FakeHAServer()
+        await server.start()
+        try:
+            push = HAPush()
+            push._host, push._port = "127.0.0.1", PORT
+            await push.connect(["media_player.kitchen", "media_player.den"],
+                               timeout=5)
+            check("auth sent", server.received[0]["type"] == "auth"
+                  and server.received[0]["access_token"] == "test-token")
+
+            changed = await push.wait_update(lambda: False)
+            # The server only emits events after processing the subscribe, so
+            # it is guaranteed to have been received by now.
+            check("subscribe sent",
+                  server.received[1]["type"] == "subscribe_entities"
+                  and server.received[1]["entity_ids"] ==
+                  ["media_player.kitchen", "media_player.den"])
+            check("snapshot event", changed ==
+                  {"media_player.kitchen", "media_player.den"})
+            kitchen = push.states["media_player.kitchen"]
+            check("snapshot fields", kitchen["state"] == "playing"
+                  and kitchen["artist"] == "Artist A"
+                  and kitchen["picture"] == "/img/1.png"
+                  and push.states["media_player.den"]["name"] == "Den")
+
+            changed = await push.wait_update(lambda: False)
+            check("diff event", changed == {"media_player.kitchen"}
+                  and kitchen["artist"] == "Artist B"
+                  and kitchen["title"] == "Song Two")
+
+            await push.wait_update(lambda: False)
+            check("state diff + removal applied",
+                  kitchen["state"] == "paused" and kitchen["picture"] is None)
+
+            check("should_stop honoured",
+                  await push.wait_update(lambda: True) is None)
+
+            # Next wait: client auto-pongs the server's ping, then the server
+            # closes — the client must surface that as OSError.
+            raised = False
+            try:
+                await push.wait_update(lambda: False)
+            except OSError:
+                raised = True
+            check("close surfaces as OSError", raised)
+            check("client answered ws ping", server.pong_payload == b"keepalive")
+            check("server script completed", server.done)
+            push.close()
+        finally:
+            server.close()
+
+    asyncio.run(run())
+
+
+def test_soak():
+    # Thousands of randomized update cycles: no leak, no crash, no runaway.
+    import gc
+    from app import hw
+    from app.app import App
+    from app.buttons import EV_B_SHORT
+
+    lcg = [12345]
+
+    def rnd(n):
+        lcg[0] = (lcg[0] * 1103515245 + 12345) & 0x7FFFFFFF
+        return lcg[0] % n
+
+    async def run():
+        app = App()
+        fake = FakeHA()
+        fake.state = _mkstate()
+        app.ha = fake
+        app.current_speaker = "media_player.kitchen"
+        app.state = _mkstate()
+        app.playback_screen.draw()
+
+        gc.collect()
+        base = gc.mem_alloc()
+        for i in range(2000):
+            state = _mkstate(volume=rnd(100) / 100.0,
+                             title="Track %d" % rnd(40),
+                             artist="Artist %d" % rnd(15),
+                             state="playing" if rnd(4) else "paused")
+            app.playback_screen.update(state)
+            if i % 250 == 249:  # periodic menu round-trip
+                await app.screen.handle(EV_B_SHORT)
+                await app.screen.handle(EV_B_SHORT)
+        gc.collect()
+        growth = gc.mem_alloc() - base
+        check("soak: heap growth bounded (%d bytes)" % growth, growth < 16384)
+        check("soak: rendering active", hw.display.update_count > 1500)
+
+    asyncio.run(run())
+
+
 def main():
     for test in (test_imports, test_pure_helpers, test_ha_template,
                  test_button_queue, test_png_decoder,
-                 test_art_pipeline_states, test_app_smoke):
+                 test_art_pipeline_states, test_app_smoke,
+                 test_hapush_diff_merge, test_websocket_end_to_end,
+                 test_soak):
         test()
     try:  # adjust_brightness persists to cwd — don't leave it behind
         import os

@@ -22,17 +22,20 @@ from app import hw, log, screens
 from app.artwork import ArtPipeline, DECODING, DOWNLOADING
 from app.buttons import Buttons, EV_X_TAP, EV_Y_TAP
 from app.ha import HAClient
+from app.hapush import HAPush
 from app.net import WiFi
 from app.power import PowerManager
-from app.settings import (DEEP_SLEEP_TIMEOUT, DEFAULT_BRIGHTNESS,
-                          MIN_BRIGHTNESS, POLL_INTERVAL, SCREEN_SLEEP_TIMEOUT)
+from app.settings import (DEEP_SLEEP_TIMEOUT, DEFAULT_BRIGHTNESS, HTTP_TIMEOUT,
+                          MIN_BRIGHTNESS, POLL_INTERVAL, SCREEN_SLEEP_TIMEOUT,
+                          USE_WEBSOCKET)
 
 _BRIGHTNESS_FILE = "brightness.json"
 _BRIGHTNESS_STEP = 0.05
 _WIFI_CHECK_S = 30
 _GC_INTERVAL_MS = 5000
 _LOOP_TICK_MS = 50          # action-loop cadence; button events bypass it
-_POLL_FAILURE_LIMIT = 3     # consecutive poll failures before the error screen
+_POLL_FAILURE_LIMIT = 3     # consecutive update failures before the error screen
+_WS_RETRY_S = 30            # REST-poll this long before retrying a dropped socket
 
 
 class App:
@@ -47,6 +50,7 @@ class App:
         self.speakers = []
         self.current_speaker = None  # entity_id
         self.force_poll = False      # set after next/prev for an immediate poll
+        self.push = None             # active HAPush subscription, or None
         self.brightness = DEFAULT_BRIGHTNESS
 
         self.playback_screen = screens.PlaybackScreen(self)
@@ -88,9 +92,14 @@ class App:
         self.set_screen(self.menu_screen)
 
     async def to_playback(self):
-        new_state = await self.ha.get_state()
-        if new_state:
-            self.state = new_state
+        if self.push is not None:
+            # Push kept the state fresh the whole time — no REST fetch, which
+            # would open a second socket beside the websocket.
+            self.state = self.push.states.get(self.current_speaker, self.state)
+        else:
+            new_state = await self.ha.get_state()
+            if new_state:
+                self.state = new_state
         self.set_screen(self.playback_screen)
 
     def redraw_current(self):
@@ -129,10 +138,15 @@ class App:
 
     async def select_speaker(self, entity_id):
         self.current_speaker = entity_id
-        self.ha.set_entity(entity_id)
-        new_state = await self.ha.get_state()
-        if new_state:
-            self.state = new_state
+        self.ha.set_entity(entity_id)  # keep the REST fallback aligned
+        if self.push is not None:
+            # Instant switch: all speakers are already subscribed. A speaker
+            # not yet subscribed makes the session restart with the new list.
+            self.state = self.push.states.get(entity_id)
+        else:
+            new_state = await self.ha.get_state()
+            if new_state:
+                self.state = new_state
         self.set_screen(self.playback_screen)
 
     # ---- brightness --------------------------------------------------------
@@ -158,10 +172,32 @@ class App:
 
     # ---- background tasks --------------------------------------------------
 
-    async def _state_poll_task(self):
+    def _handle_new_state(self, new_state):
+        """Store fresh state; draw as much as the current screen allows."""
+        self._poll_failures = 0
+        self.state = new_state
+        if self.screen is not self.playback_screen or self.power.screen_sleeping:
+            # Keep the data, defer drawing until the playback screen shows.
+            self.playback_screen.invalidate()
+        else:
+            self.playback_screen.update(new_state)
+
+    def _handle_state_failure(self):
+        self._poll_failures += 1
+        if (self._poll_failures >= _POLL_FAILURE_LIMIT and
+                self.screen is self.playback_screen and
+                not self.power.screen_sleeping):
+            self.wifi.check()  # classify the outage for the error screen
+            self.playback_screen.update(None)
+
+    async def _poll_loop(self, duration_s):
+        """REST-poll loop (template API). duration_s None = run forever;
+        otherwise poll for that long and return (websocket retry window)."""
         elapsed = 0.0
-        while True:
+        ran = 0.0
+        while duration_s is None or ran < duration_s:
             await asyncio.sleep(0.1)
+            ran += 0.1
             elapsed += 0.1
             if not self.force_poll and elapsed < POLL_INTERVAL:
                 continue
@@ -169,29 +205,65 @@ class App:
             elapsed = 0.0
             if self.power.deep_sleeping:
                 continue
-            if self.screen is not self.playback_screen:
-                # Full redraw when the playback screen next shows.
-                self.playback_screen.invalidate()
-                continue
-            if self.power.screen_sleeping:
-                # Keep state fresh (and WiFi active) but draw nothing.
-                new_state = await self.ha.get_state()
-                if new_state:
-                    self.state = new_state
+            if self.screen is not self.playback_screen and not self.power.screen_sleeping:
+                # In a menu: skip the fetch, force a redraw on return.
                 self.playback_screen.invalidate()
                 continue
             if self.art.state == DOWNLOADING:
                 continue  # CYW43: one HTTP connection at a time
             new_state = await self.ha.get_state()
             if new_state:
-                self._poll_failures = 0
-                self.state = new_state
-                self.playback_screen.update(new_state)
+                self._handle_new_state(new_state)
             else:
-                self._poll_failures += 1
-                if self._poll_failures >= _POLL_FAILURE_LIMIT:
-                    self.wifi.check()  # classify the outage for the error screen
-                    self.playback_screen.update(None)
+                self._handle_state_failure()
+
+    async def _push_session(self):
+        """One WebSocket subscription covering all discovered speakers.
+        Returns True on a clean stop (deep sleep, or the selected speaker is
+        not in the subscription — reconnect immediately with the new list),
+        False on a connection error (caller backs off to REST polling)."""
+        push = HAPush()
+        try:
+            await push.connect([s["entity_id"] for s in self.speakers],
+                               timeout=HTTP_TIMEOUT)
+        except (OSError, ValueError, asyncio.TimeoutError) as e:
+            log.debug("push connect failed: %r" % e)
+            push.close()
+            return False
+        self.push = push
+
+        def should_stop():
+            return (self.power.deep_sleeping or
+                    self.current_speaker not in push.subscribed)
+
+        try:
+            while True:
+                changed = await push.wait_update(should_stop)
+                if changed is None:
+                    return True
+                if self.current_speaker in changed:
+                    self._handle_new_state(push.states[self.current_speaker])
+        except (OSError, ValueError, asyncio.TimeoutError) as e:
+            log.info("push dropped: %r" % e)
+            self._handle_state_failure()
+            return False
+        finally:
+            self.push = None
+            push.close()
+
+    async def _state_task(self):
+        """Keep app.state fresh — via WebSocket push when enabled, with REST
+        template polling as the fallback (and the only mode when disabled)."""
+        while True:
+            if (not self.current_speaker or self.power.deep_sleeping or
+                    not self.wifi.connected):
+                await asyncio.sleep(0.5)
+                continue
+            if USE_WEBSOCKET:
+                if not await self._push_session():
+                    await self._poll_loop(_WS_RETRY_S)
+            else:
+                await self._poll_loop(None)
 
     async def _wifi_check_task(self):
         while True:
@@ -297,7 +369,7 @@ class App:
         self.speaker_screen.allow_back = True
 
         gc.threshold(gc.mem_free() // 4 + gc.mem_alloc())
-        asyncio.create_task(self._state_poll_task())
+        asyncio.create_task(self._state_task())
         asyncio.create_task(self._wifi_check_task())
         await self._action_loop()
 

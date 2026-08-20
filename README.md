@@ -53,6 +53,8 @@ app/
   pngfilters_viper.py  Viper-accelerated PNG primitives (device fast path)
   pngfilters.py    Pure-Python PNG primitives (reference + fallback)
   ha.py            Home Assistant REST client
+  hapush.py        Push state updates via HA's WebSocket API
+  wsclient.py      Minimal WebSocket client (RFC 6455)
   httpc.py         Minimal async HTTP client
   net.py           WiFi connection manager
   hw.py            Display, pens, LED, buttons, display lock
@@ -99,6 +101,7 @@ All tunables are optional entries in `config.py` (see `config_example.py`) — n
 | `MIN_BRIGHTNESS` | `0.25` | Minimum brightness (0.0–1.0) reachable via the Brightness menu |
 | `DEFAULT_BRIGHTNESS` | `1.0` | Brightness before any saved setting exists |
 | `HTTP_TIMEOUT` | `10` | Seconds allowed per HTTP operation |
+| `USE_WEBSOCKET` | `True` | Push updates via HA's WebSocket API; `False` for REST polling only |
 | `DEBUG` | `False` | Verbose logging on the USB console |
 
 ### Two-tier sleep
@@ -111,19 +114,21 @@ When the device is awake the LED is solid green.
 
 ## Architecture Notes
 
-- **Core 0** runs the asyncio event loop: the main action loop, a state poll task, a WiFi check task, and ad-hoc album art tasks. **Core 1** polls the buttons every 5 ms, paints instant press feedback, and queues events for Core 0 via a `ThreadSafeFlag`.
-- State polling uses HA's `/api/template` endpoint to fetch only the seven fields the display shows (~200 bytes/poll) rather than the full Sonos entity state.
+- **Core 0** runs the asyncio event loop: the main action loop, a state task, a WiFi check task, and ad-hoc album art tasks. **Core 1** polls the buttons every 5 ms, paints instant press feedback, and queues events for Core 0 via a `ThreadSafeFlag`.
+- State updates arrive by **push**: one WebSocket subscription (`subscribe_entities`) covers every discovered speaker, so track changes appear in well under a second, switching speakers is instant, and idle network traffic is near zero. Only the seven display-relevant fields are kept per speaker. If the socket drops, the app falls back to REST polling of HA's `/api/template` endpoint (~200 bytes/poll) and periodically retries the socket; `USE_WEBSOCKET = False` forces polling mode permanently.
 - Album art (PNG or JPEG, detected by magic bytes) is decoded once into an 80×80 RGB565 pixel cache; redraws are a pure framebuffer copy. PNGs are downscaled with a custom streaming box-averaging decoder, since the stock `pngdec` cannot downscale.
 - A `display_lock` protects every framebuffer-build → `display.update()` sequence across both cores.
 
 ## Development
 
 ```
-make test     # CPython unit tests + MicroPython suite (if installed)
-make test-mpy # app modules under real MicroPython (unix port, stubbed hardware)
-make lint     # ruff
-make deploy   # copy code to the device
-make console  # serial REPL
+make test       # CPython unit tests + MicroPython suite (if installed)
+make test-mpy   # app modules under real MicroPython (unix port, stubbed hardware)
+make test-live  # read-only network check against your real HA (home LAN only)
+make lint       # ruff
+make deploy     # copy code to the device
+make deploy-mpy # precompiled .mpy deploy (needs mpy-cross matching the firmware)
+make console    # serial REPL
 ```
 
 The MicroPython suite (`tests/mpy/run_tests.py`, `brew install micropython`)

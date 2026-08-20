@@ -15,6 +15,8 @@ class PicoGraphics:
 
     def _rec(self, name, *args):
         self.calls.append((name, args))
+        if len(self.calls) > 400:  # keep soak tests from measuring the stub
+            self.calls = self.calls[-200:]
 
     def get_bounds(self):
         return 320, 240

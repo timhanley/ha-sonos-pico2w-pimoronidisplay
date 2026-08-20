@@ -13,4 +13,6 @@ HA_TOKEN = "YOUR_HOME_ASSISTANT_LONG_LIVED_TOKEN"
 # MIN_BRIGHTNESS = 0.25         # brightness floor in the Brightness menu
 # DEFAULT_BRIGHTNESS = 1.0
 # HTTP_TIMEOUT = 10             # seconds per HTTP operation
+# USE_WEBSOCKET = True          # push updates via HA's websocket API;
+#                               # set False to use REST polling only
 # DEBUG = False                 # verbose logging on the USB console

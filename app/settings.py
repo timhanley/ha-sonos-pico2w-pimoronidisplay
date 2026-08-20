@@ -21,4 +21,6 @@ DEEP_SLEEP_TIMEOUT = _opt("DEEP_SLEEP_TIMEOUT", 3600)     # s idle before deep s
 MIN_BRIGHTNESS = _opt("MIN_BRIGHTNESS", 0.25)       # floor reachable via the Brightness menu
 DEFAULT_BRIGHTNESS = _opt("DEFAULT_BRIGHTNESS", 1.0)
 HTTP_TIMEOUT = _opt("HTTP_TIMEOUT", 10)             # s per HTTP I/O operation
+USE_WEBSOCKET = _opt("USE_WEBSOCKET", True)         # push updates via HA websocket;
+                                                    # False = REST polling only
 DEBUG = _opt("DEBUG", False)                        # enables log.debug() output
