@@ -4,6 +4,18 @@ The v2 rewrite (commits `4fe6afd`…`bce5e9a`) has been syntax-checked, linted,
 and unit-tested, but has **never run on the device**. Work through this
 checklist on the Pico before trusting it or pushing/tagging the release.
 
+## 0. Before flashing — live network check (home LAN, no hardware needed)
+
+```
+make test-live
+```
+
+Read-only verification of the REST API, speaker discovery, the template
+state poll, and a WebSocket subscription against your REAL Home Assistant
+using the real config.py. Must print `LIVE CHECK PASSED` before anything is
+flashed — it retires the "does the network layer speak real-HA" risk from
+your Mac, without touching the speakers.
+
 Deploy first:
 
 ```
@@ -83,7 +95,32 @@ Deep sleep (set `DEEP_SLEEP_TIMEOUT = 60` temporarily):
       the CYW43 "F2 not ready" stall scenario the chip-off design prevents)
 - [ ] Restore real timeout values in config.py afterwards
 
-## 6. Failure modes
+## 6. Push mode (WebSocket)
+
+The state task uses one WebSocket subscription covering all speakers by
+default, falling back to REST polling on socket errors.
+
+- [ ] Boot console shows "push: subscribed to N speakers"
+- [ ] Change track from another Sonos controller: the display updates in
+      well under a second (push), not on a ~1 s poll cadence
+- [ ] Switch speakers via the menu: the new speaker's state appears
+      INSTANTLY (already subscribed — no fetch)
+- [ ] **CYW43 concurrent-socket check (the one relaxed v1 invariant):** with
+      push connected, play an art-changing track — the art download opens a
+      second socket beside the idle websocket. Repeat across several album
+      changes. Watch for CYW43 stalls/errors on the console. If unstable,
+      set `USE_WEBSOCKET = False` in config.py (polling never overlaps
+      sockets) and report it
+- [ ] Restart Home Assistant while the device is showing playback: console
+      shows "push dropped", REST polling takes over (screen keeps updating
+      within a few seconds), and the socket reconnects within ~30 s of HA
+      coming back ("push: subscribed" again)
+- [ ] Deep sleep + wake in push mode: after the WiFi reconnect the
+      subscription re-establishes and updates flow again
+- [ ] Set `USE_WEBSOCKET = False`, reboot: everything in sections 1-5 still
+      works in pure polling mode
+
+## 7. Failure modes
 
 - [ ] Stop HA (or firewall it): within ~3 s of polling, "Home Assistant
       Unavailable" appears once (no flashing); restart HA: playback screen
@@ -94,7 +131,7 @@ Deep sleep (set `DEEP_SLEEP_TIMEOUT = 60` temporarily):
       reconnects within ~30 s (wifi_check_task) without a UI freeze
 - [ ] Wrong HA_TOKEN in config: boot reaches "Cannot Reach HA" gracefully
 
-## 7. Soak
+## 8. Soak
 
 - [ ] Leave playing with art-changing tracks for 2+ hours: no crash, no
       memory errors on console, no display tearing/white bars
@@ -124,6 +161,9 @@ traceback:
    threading, the CYW43 WiFi paths, and deep-sleep wake. On boot the console
    must NOT print "PNG: viper emitter unavailable" — the Pimoroni RP2350
    build has viper, so that line appearing means the fast path regressed.
+4. The websocket + art-download concurrent sockets on the CYW43 (section 6).
+   v1 never held two sockets at once; push mode does, briefly, during art
+   downloads and service calls. `USE_WEBSOCKET = False` is the escape hatch.
 
 When everything passes: update TESTING.md status below, then push and tag
 `v2.0.0`.
