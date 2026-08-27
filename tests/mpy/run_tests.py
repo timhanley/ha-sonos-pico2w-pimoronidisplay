@@ -249,6 +249,48 @@ def test_hapush_diff_merge():
     check("diff state + removal", st["state"] == "paused" and st["artist"] is None)
 
 
+def test_hapush_ping_ids_increase():
+    # Regression: every command on one connection needs a fresh, increasing
+    # id. The second idle keepalive ping used to resend id 2 — real HA
+    # answers {'code': 'id_reuse'} and the connection drops every ~60 s.
+    import json
+    from app.hapush import HAPush
+
+    sent = []
+
+    class FakeWS:
+        # Idle line: recv times out until a ping is sent, then delivers the
+        # matching pong once. Enough to drive wait_update through two full
+        # idle→ping→pong cycles without waiting real seconds.
+        def __init__(self):
+            self._owed_pong = False
+
+        async def send(self, text):
+            msg = json.loads(text)
+            sent.append(msg)
+            if msg.get("type") == "ping":
+                self._owed_pong = True
+
+        async def recv(self, timeout):
+            if self._owed_pong:
+                self._owed_pong = False
+                return json.dumps({"id": sent[-1]["id"], "type": "pong"})
+            raise asyncio.TimeoutError
+
+    push = HAPush()
+    ws = FakeWS()
+    push._ws = ws
+
+    def two_pings_answered():
+        pings = [m for m in sent if m.get("type") == "ping"]
+        return len(pings) >= 2 and not ws._owed_pong
+
+    asyncio.run(push.wait_update(two_pings_answered))
+    ids = [m["id"] for m in sent]
+    check("ping ids strictly increase",
+          len(ids) >= 2 and all(b > a for a, b in zip(ids, ids[1:])))
+
+
 def test_websocket_end_to_end():
     # Real TCP loopback: wsclient + hapush against a scripted RFC 6455 server.
     from app.hapush import HAPush
@@ -354,7 +396,8 @@ def main():
     for test in (test_imports, test_pure_helpers, test_ha_template,
                  test_button_queue, test_png_decoder,
                  test_art_pipeline_states, test_app_smoke,
-                 test_hapush_diff_merge, test_websocket_end_to_end,
+                 test_hapush_diff_merge, test_hapush_ping_ids_increase,
+                 test_websocket_end_to_end,
                  test_soak):
         test()
     try:  # adjust_brightness persists to cwd — don't leave it behind

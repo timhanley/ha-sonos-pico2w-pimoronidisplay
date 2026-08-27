@@ -42,13 +42,19 @@ class HAPush:
     def __init__(self):
         self._host, self._port, _ = parse_url(HA_URL)
         self._ws = None
+        self._msg_id = 0  # HA requires strictly increasing ids per connection
         self.states = {}  # entity_id -> compact state dict
         self.subscribed = ()
+
+    def _next_id(self):
+        self._msg_id += 1
+        return self._msg_id
 
     async def connect(self, entity_ids, timeout=10):
         """Open, authenticate, and subscribe. Raises OSError on failure."""
         self._ws = await WebSocket.connect(
             self._host, self._port, "/api/websocket", timeout)
+        self._msg_id = 0  # fresh connection, fresh id space
         try:
             msg = await self._recv_json(timeout)
             if msg.get("type") != "auth_required":
@@ -59,7 +65,7 @@ class HAPush:
             if msg.get("type") != "auth_ok":
                 raise OSError("websocket auth failed: %s" % msg.get("type"))
             await self._ws.send(json.dumps(
-                {"id": 1, "type": "subscribe_entities",
+                {"id": self._next_id(), "type": "subscribe_entities",
                  "entity_ids": list(entity_ids)}))
             self.subscribed = tuple(entity_ids)
             self.states = {e: _empty_state() for e in entity_ids}
@@ -127,7 +133,8 @@ class HAPush:
                     if awaiting_pong > _PING_GRACE_S:
                         raise OSError("websocket ping timeout")
                 elif idle >= _IDLE_PING_S:
-                    await self._ws.send(json.dumps({"id": 2, "type": "ping"}))
+                    await self._ws.send(json.dumps(
+                        {"id": self._next_id(), "type": "ping"}))
                     awaiting_pong = 1
                 continue
             if raw is None:
@@ -141,7 +148,8 @@ class HAPush:
                 if changed:
                     return changed
             elif msg_type == "result" and not msg.get("success", True):
-                raise OSError("subscribe failed: %s" % msg.get("error"))
+                # any command's failure result lands here (subscribe, ping, …)
+                raise OSError("ws command failed: %s" % msg.get("error"))
             # pong / result-ok / anything else: liveness only
 
     def close(self):
