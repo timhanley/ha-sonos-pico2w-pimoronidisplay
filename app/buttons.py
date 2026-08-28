@@ -17,7 +17,7 @@ import _thread
 
 import asyncio
 
-from app import hw
+from app import hw, log
 
 # Event codes (queue entries)
 EV_A_SHORT = 0   # play/pause, menu select
@@ -73,8 +73,12 @@ class Buttons:
         self._q = []
         self._qlock.release()
         now = time.ticks_ms()
-        return [ev for ev, t in entries
-                if time.ticks_diff(now, t) <= STALE_EVENT_MS]
+        events = [ev for ev, t in entries
+                  if time.ticks_diff(now, t) <= STALE_EVENT_MS]
+        if len(events) != len(entries):
+            log.debug("btn dropped %d stale, kept %d" %
+                      (len(entries) - len(events), len(events)))
+        return events
 
     def clear(self):
         """Discard pending events (e.g. the press that woke the device)."""

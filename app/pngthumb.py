@@ -41,6 +41,11 @@ async def decode_thumbnail(path, out_w=80, out_h=80):
         log.error("PNG decode: deflate module not available")
         return None
     gc.collect()
+    # Threshold GC fires constantly during the row loop's allocation churn
+    # and multiplies decode time; disable it for the decode, restore after.
+    # (A genuinely full heap still auto-collects on allocation failure.)
+    gc_thr = gc.threshold()
+    gc.threshold(-1)
     f = None
     use_tmp = False
     try:
@@ -84,6 +89,9 @@ async def decode_thumbnail(path, out_w=80, out_h=80):
         if not idat_segs:
             log.error("PNG: no IDAT chunks found")
             return None
+        log.debug("png %dx%d bpp=%d segs=%d idat=%d" %
+                  (iw, ih, bpp, len(idat_segs),
+                   sum(dlen for _, dlen in idat_segs)))
 
         # Prepare the ZLIB source stream.
         if len(idat_segs) == 1:
@@ -106,6 +114,7 @@ async def decode_thumbnail(path, out_w=80, out_h=80):
                             break
                         idx += got
                         remaining -= got
+                        await asyncio.sleep(0)
                 bio = BytesIO(idat_data)
                 del idat_data
                 gc.collect()
@@ -127,6 +136,9 @@ async def decode_thumbnail(path, out_w=80, out_h=80):
                                 break
                             tmp.write(memoryview(buf)[:got])
                             remaining -= got
+                            # flash-to-flash copy of a whole image — without
+                            # this yield it stalls the event loop for seconds
+                            await asyncio.sleep(0)
                 f.close()
                 f = open(_IDAT_TMP, "rb")
                 use_tmp = True
@@ -137,24 +149,26 @@ async def decode_thumbnail(path, out_w=80, out_h=80):
         out = bytearray(out_w * out_h * 2)
         row = bytearray(row_stride)
         prev = bytearray(row_stride)
+        row_mv = memoryview(row)
+        fbuf = bytearray(1)
         acc = bytearray(out_w * 6)
         out_y = 0
         row_in_box = 0
         for src_y in range(ih):
             if out_y >= out_h:
                 break
-            fb = zlib.read(1)
-            if not fb:
+            # readinto everywhere: zlib.read() allocates a fresh buffer per
+            # call, and that churn (plus the GC it triggers) dominated decode
+            # time on-device — 32 ms/row against ~2 ms of actual filter work.
+            if zlib.readinto(fbuf) != 1:
                 break
-            filter_type = fb[0]
+            filter_type = fbuf[0]
             offset = 0
             while offset < row_stride:
-                chunk = zlib.read(row_stride - offset)
-                if not chunk:
+                got = zlib.readinto(row_mv[offset:] if offset else row_mv)
+                if not got:
                     break
-                clen = len(chunk)
-                row[offset:offset + clen] = chunk
-                offset += clen
+                offset += got
             if offset < row_stride:
                 break
             if filter_type == 1:
@@ -172,6 +186,7 @@ async def decode_thumbnail(path, out_w=80, out_h=80):
                 out_y += 1
                 row_in_box = 0
             row, prev = prev, row
+            row_mv = memoryview(row)
             if src_y % 5 == 4:
                 await asyncio.sleep(0)
         if out_y < out_h:
@@ -180,6 +195,7 @@ async def decode_thumbnail(path, out_w=80, out_h=80):
     finally:
         # try/finally (no except) — required for await asyncio.sleep(0) to work
         # correctly in MicroPython. Exceptions propagate to the caller.
+        gc.threshold(gc_thr)
         if f:
             f.close()
         if use_tmp:

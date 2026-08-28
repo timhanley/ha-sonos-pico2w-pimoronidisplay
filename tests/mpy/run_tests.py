@@ -235,11 +235,10 @@ def test_app_smoke():
     asyncio.run(run())
 
 
-def test_media_command_yields_socket():
-    # Regression: a button command during an art download must cancel the
-    # download (one CYW43 HTTP connection at a time) instead of stalling the
-    # action loop behind a competing connection, and must force a full
-    # redraw so the art zone restarts the download afterwards.
+def test_media_command_during_download():
+    # Regression: a command during an art download must leave the download
+    # alone. Cancelling per press churned TCP connections until lwIP ran out
+    # of sockets (OSError 12) and the art never finished (found on-device).
     from app import artwork
     from app.app import App
 
@@ -249,13 +248,11 @@ def test_media_command_yields_socket():
         app.ha = fake
         app.current_speaker = "media_player.kitchen"
         app.state = _mkstate()
-        app.playback_screen.prev_visible = ("anything",)
         app.art.state = artwork.DOWNLOADING
         await app.media_command("volume_up")
-        check("download cancelled for command", app.art.state == artwork.IDLE)
+        check("download untouched by command",
+              app.art.state == artwork.DOWNLOADING)
         check("command still sent", fake.services == ["volume_up"])
-        check("full redraw forced for art restart",
-              app.playback_screen.prev_visible is None)
 
     asyncio.run(run())
 
@@ -428,7 +425,7 @@ def main():
     for test in (test_imports, test_pure_helpers, test_ha_template,
                  test_button_queue, test_png_decoder,
                  test_art_pipeline_states, test_app_smoke,
-                 test_media_command_yields_socket,
+                 test_media_command_during_download,
                  test_hapush_diff_merge, test_hapush_ping_ids_increase,
                  test_websocket_end_to_end,
                  test_soak):

@@ -10,6 +10,7 @@
 # the PicoGraphics framebuffer layout — required for the memcpy fast path.
 import gc
 import os
+import time
 
 import asyncio
 
@@ -111,7 +112,9 @@ class ArtPipeline:
             if magic[:4] == b"\x89PNG":
                 # HTTP connection is closed now — DECODING lets the state poll resume.
                 self.state = DECODING
+                t0 = time.ticks_ms()
                 cache = await pngthumb.decode_thumbnail(_ART_FILE, ART_SIZE, ART_SIZE)
+                log.debug("png decode %d ms" % time.ticks_diff(time.ticks_ms(), t0))
                 if cache is None:
                     log.error("PNG thumbnail decode failed")
                     self.state = IDLE
