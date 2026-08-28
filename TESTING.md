@@ -168,4 +168,17 @@ traceback:
 When everything passes: update TESTING.md status below, then push and tag
 `v2.0.0`.
 
-**Status: NOT YET TESTED ON HARDWARE**
+**Status: PASSED on hardware, 2026-08-28.** Findings during the pass, all
+fixed and re-verified on the device:
+
+- WebSocket dropped every ~60 s (`id_reuse` — hardcoded message ids); fixed
+  with a per-connection id counter (`a70d8a8`).
+- Buttons froze and "HA Connection Error" flashed during PNG art loads.
+  On-device tracing found the real causes: an unyielding flash-to-flash
+  multi-IDAT copy (4.8 s stall), allocation churn making the decode
+  32 ms/row, and — from an interim wrong fix — TCP connection churn
+  exhausting lwIP sockets (OSError 12). Fixed in `57c53c1`/`a3c1a54`:
+  decode 17.5 s → ~6 s, worst event-loop stall 85 ms, stale queued button
+  events dropped at drain.
+- Media commands moved from per-press REST calls (~600 ms median) to the
+  already-open push WebSocket with REST fallback (`48671c9`).
