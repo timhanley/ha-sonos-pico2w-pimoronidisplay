@@ -6,6 +6,13 @@
 # second press that lands before the first is processed, and Core 0 no longer
 # spins at 5 ms.
 #
+# Blob lifecycle: a button's blob is lit while it is held, while Core 0 is
+# still running its action (set_busy — the "please stop mashing" indicator),
+# and for FEEDBACK_MS after the press so even instant actions visibly flash.
+# Core 1 repaints on any blob COLOUR TRANSITION, not on raw press/release
+# edges — that is what clears a blob when the fade window or the action ends
+# (v2.0.0 bug: edge-only repaints left blobs stuck green).
+#
 # INVARIANT: start() must be called before any UI loop that expects button
 # input (v1 bug: buttons were dead during speaker selection when Core 1
 # started too late).
@@ -28,9 +35,14 @@ EV_X_TAP = 4     # volume up / menu up
 EV_Y_TAP = 5     # volume down / menu down
 
 LONG_PRESS_MS = 1000
-FEEDBACK_MS = 200      # how long the green press blob lingers after release
+FEEDBACK_MS = 200      # minimum blob shine per press, even for instant actions
 _POLL_MS = 5
 STALE_EVENT_MS = 1500  # events queued longer than this are dropped at drain
+
+# Blob colour codes (what the label renderer paints per button)
+BLOB_NONE = 0    # gray
+BLOB_ACTIVE = 1  # green
+BLOB_LONG = 2    # blue
 
 
 class Buttons:
@@ -44,6 +56,8 @@ class Buttons:
         self.a_held = self.b_held = self.x_held = self.y_held = False
         self.a_long_active = False   # blue blob while a long press is latched
         self.b_long_active = False
+        # BLOB_* while Core 0 runs the button's action (written by Core 0):
+        self.a_busy = self.b_busy = self.x_busy = self.y_busy = BLOB_NONE
         self.last_activity_ms = time.ticks_ms()
         # Core 1 calls this (if set) on any press/release to repaint labels.
         # The callback must acquire display_lock itself.
@@ -93,6 +107,37 @@ class Buttons:
         """Register activity from Core 0 (e.g. on wake)."""
         self.last_activity_ms = time.ticks_ms()
 
+    def set_busy(self, ev, on):
+        """Mark/unmark the button whose action Core 0 is running — its blob
+        stays lit until the action completes (Core 1 repaints on the change)."""
+        code = BLOB_NONE
+        if on:
+            code = BLOB_LONG if ev in (EV_A_LONG, EV_B_LONG) else BLOB_ACTIVE
+        if ev in (EV_A_SHORT, EV_A_LONG):
+            self.a_busy = code
+        elif ev in (EV_B_SHORT, EV_B_LONG):
+            self.b_busy = code
+        elif ev == EV_X_TAP:
+            self.x_busy = code
+        elif ev == EV_Y_TAP:
+            self.y_busy = code
+
+    @staticmethod
+    def _blob(now, held, press_ms, busy, long_active):
+        if long_active or busy == BLOB_LONG:
+            return BLOB_LONG
+        if held or busy or time.ticks_diff(now, press_ms) < FEEDBACK_MS:
+            return BLOB_ACTIVE
+        return BLOB_NONE
+
+    def blob_code(self, now):
+        """Blob colours for (A,B,X,Y) packed 2 bits each into one int —
+        allocation-free, safe for Core 1 to call every poll."""
+        return (self._blob(now, self.a_held, self.a_ms, self.a_busy, self.a_long_active)
+                | self._blob(now, self.b_held, self.b_ms, self.b_busy, self.b_long_active) << 2
+                | self._blob(now, self.x_held, self.x_ms, self.x_busy, False) << 4
+                | self._blob(now, self.y_held, self.y_ms, self.y_busy, False) << 6)
+
     @staticmethod
     def any_pin_pressed():
         """Direct pin poll — for deep sleep, when Core 1 is stopped."""
@@ -109,9 +154,9 @@ class Buttons:
 
     def _core1(self):
         a_start = b_start = 0  # press timestamps (ticks_ms)
+        last_blobs = 0
         while self.running:
             now = time.ticks_ms()
-            changed = False
 
             # A and B: short press fires on release, long press at threshold.
             if hw.button_a.value() == 0:
@@ -120,19 +165,16 @@ class Buttons:
                     a_start = now
                     self.a_ms = now
                     self.last_activity_ms = now
-                    changed = True
                 elif not self.a_long_active and time.ticks_diff(now, a_start) >= LONG_PRESS_MS:
                     self.a_long_active = True
                     self.a_ms = now
                     self._push(EV_A_LONG)
-                    changed = True
             elif self.a_held:
                 if not self.a_long_active:
                     self.a_ms = now
                     self._push(EV_A_SHORT)
                 self.a_held = False
                 self.a_long_active = False
-                changed = True
 
             if hw.button_b.value() == 0:
                 if not self.b_held:
@@ -140,19 +182,16 @@ class Buttons:
                     b_start = now
                     self.b_ms = now
                     self.last_activity_ms = now
-                    changed = True
                 elif not self.b_long_active and time.ticks_diff(now, b_start) >= LONG_PRESS_MS:
                     self.b_long_active = True
                     self.b_ms = now
                     self._push(EV_B_LONG)
-                    changed = True
             elif self.b_held:
                 if not self.b_long_active:
                     self.b_ms = now
                     self._push(EV_B_SHORT)
                 self.b_held = False
                 self.b_long_active = False
-                changed = True
 
             # X and Y: tap on press; hold-repeat is generated by Core 0
             # from the held flags.
@@ -162,7 +201,6 @@ class Buttons:
                     self.x_ms = now
                     self.last_activity_ms = now
                     self._push(EV_X_TAP)
-                    changed = True
             else:
                 self.x_held = False
 
@@ -172,11 +210,15 @@ class Buttons:
                     self.y_ms = now
                     self.last_activity_ms = now
                     self._push(EV_Y_TAP)
-                    changed = True
             else:
                 self.y_held = False
 
-            if changed and self.feedback_draw:
-                self.feedback_draw()
+            # Repaint on any blob colour transition: press, release, the
+            # FEEDBACK_MS fade-out, and Core 0's busy changes all land here.
+            blobs = self.blob_code(now)
+            if blobs != last_blobs:
+                last_blobs = blobs
+                if self.feedback_draw:
+                    self.feedback_draw()
 
             time.sleep_ms(_POLL_MS)

@@ -83,6 +83,60 @@ def test_button_queue():
     check("stale events dropped, fresh kept", b.get_events() == [EV_X_TAP])
 
 
+def test_button_blobs():
+    # Blob lifecycle: lit while held, while Core 0 runs the action (busy),
+    # and for FEEDBACK_MS after the press; clears when all three end.
+    import time
+    from app.buttons import (BLOB_ACTIVE, BLOB_LONG, Buttons, EV_A_LONG,
+                             EV_X_TAP, FEEDBACK_MS)
+    b = Buttons()
+    now = time.ticks_ms()
+    old = now - FEEDBACK_MS - 1
+    b.a_ms = b.b_ms = b.x_ms = b.y_ms = old  # all fade windows expired
+    check("all blobs idle", b.blob_code(now) == 0)
+    b.x_held = True
+    check("held is green", (b.blob_code(now) >> 4) & 3 == BLOB_ACTIVE)
+    b.x_held = False
+    b.x_ms = now
+    check("fresh press shines", (b.blob_code(now) >> 4) & 3 == BLOB_ACTIVE)
+    b.x_ms = old
+    b.set_busy(EV_X_TAP, True)
+    check("busy keeps blob lit past the fade window",
+          (b.blob_code(now) >> 4) & 3 == BLOB_ACTIVE)
+    b.set_busy(EV_X_TAP, False)
+    check("action completion clears the blob (v2.0.0 stuck-green bug)",
+          b.blob_code(now) == 0)
+    b.set_busy(EV_A_LONG, True)
+    check("long-press action is blue", b.blob_code(now) & 3 == BLOB_LONG)
+    b.set_busy(EV_A_LONG, False)
+    check("blue clears too", b.blob_code(now) == 0)
+
+
+def test_run_action_busy_lifecycle():
+    from app.app import App
+    from app.buttons import BLOB_ACTIVE, EV_X_TAP
+
+    async def run():
+        app = App()
+        seen = []
+
+        class Probe:
+            repeat_ms = 0
+
+            def labels(self):
+                return ("", "", "", "")
+
+            async def handle(self, ev):
+                seen.append(app.buttons.x_busy)
+
+        app.screen = Probe()
+        await app._run_action(EV_X_TAP)
+        check("busy lit during the action", seen == [BLOB_ACTIVE])
+        check("busy cleared after the action", app.buttons.x_busy == 0)
+
+    asyncio.run(run())
+
+
 def test_png_decoder():
     from app.pngthumb import decode_thumbnail
 
@@ -509,6 +563,7 @@ def test_soak():
 def main():
     for test in (test_imports, test_pure_helpers, test_ha_template,
                  test_button_queue, test_png_decoder,
+                 test_button_blobs, test_run_action_busy_lifecycle,
                  test_art_pipeline_states, test_app_smoke,
                  test_media_command_during_download,
                  test_hapush_diff_merge, test_hapush_ping_ids_increase,

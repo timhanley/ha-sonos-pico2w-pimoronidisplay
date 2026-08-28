@@ -286,6 +286,16 @@ class App:
 
     # ---- main loop ---------------------------------------------------------
 
+    async def _run_action(self, ev):
+        """Run one button event's screen action with its blob lit for the
+        duration — Core 1 repaints on the busy transitions, so the blob
+        clears the moment the action completes."""
+        self.buttons.set_busy(ev, True)
+        try:
+            await self.screen.handle(ev)
+        finally:
+            self.buttons.set_busy(ev, False)
+
     async def _wait_events(self, ms):
         """Sleep up to ms, waking early the instant Core 1 queues an event."""
         try:
@@ -337,17 +347,17 @@ class App:
                     last_x_repeat = now_ms
                 elif ev == EV_Y_TAP:
                     last_y_repeat = now_ms
-                await self.screen.handle(ev)
+                await self._run_action(ev)
 
             repeat_ms = self.screen.repeat_ms
             if repeat_ms:
                 now_ms = time.ticks_ms()
                 if self.buttons.x_held and time.ticks_diff(now_ms, last_x_repeat) >= repeat_ms:
                     last_x_repeat = now_ms
-                    await self.screen.handle(EV_X_TAP)
+                    await self._run_action(EV_X_TAP)
                 if self.buttons.y_held and time.ticks_diff(now_ms, last_y_repeat) >= repeat_ms:
                     last_y_repeat = now_ms
-                    await self.screen.handle(EV_Y_TAP)
+                    await self._run_action(EV_Y_TAP)
 
             await self._wait_events(_LOOP_TICK_MS)
 
@@ -377,7 +387,7 @@ class App:
         self.speaker_screen.draw()
         while not self.current_speaker:
             for ev in self.buttons.get_events():
-                await self.screen.handle(ev)
+                await self._run_action(ev)
             await self._wait_events(_LOOP_TICK_MS)
         self.speaker_screen.allow_back = True
 

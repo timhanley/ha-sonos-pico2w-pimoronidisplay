@@ -12,8 +12,8 @@
 import time
 
 from app import hw, textutil
-from app.buttons import (EV_A_LONG, EV_A_SHORT, EV_B_LONG, EV_B_SHORT,
-                         EV_X_TAP, EV_Y_TAP, FEEDBACK_MS)
+from app.buttons import (BLOB_ACTIVE, BLOB_LONG, EV_A_LONG, EV_A_SHORT,
+                         EV_B_LONG, EV_B_SHORT, EV_X_TAP, EV_Y_TAP)
 
 # Layout constants (320×240, bitmap8: 8px/char at scale 2)
 _FRAME_H = 197
@@ -74,21 +74,13 @@ def draw_button_labels_locked(buttons, labels):
     display.set_pen(hw.BLACK)
     display.rectangle(0, hw.HEIGHT - 40, hw.WIDTH, 40)
 
-    now = time.ticks_ms()
-    circles = (
-        (30, "A", buttons.a_held or time.ticks_diff(now, buttons.a_ms) < FEEDBACK_MS,
-         buttons.a_long_active),
-        (145, "B", buttons.b_held or time.ticks_diff(now, buttons.b_ms) < FEEDBACK_MS,
-         buttons.b_long_active),
-        (hw.WIDTH - 90, "X", buttons.x_held or time.ticks_diff(now, buttons.x_ms) < FEEDBACK_MS,
-         False),
-        (hw.WIDTH - 35, "Y", buttons.y_held or time.ticks_diff(now, buttons.y_ms) < FEEDBACK_MS,
-         False),
-    )
-    for x_pos, letter, active, long_active in circles:
-        if long_active:
+    code = buttons.blob_code(time.ticks_ms())
+    for i, (x_pos, letter) in enumerate(
+            ((30, "A"), (145, "B"), (hw.WIDTH - 90, "X"), (hw.WIDTH - 35, "Y"))):
+        blob = (code >> (2 * i)) & 3
+        if blob == BLOB_LONG:
             display.set_pen(hw.BLUE)
-        elif active:
+        elif blob == BLOB_ACTIVE:
             display.set_pen(hw.GREEN)
         else:
             display.set_pen(hw.GRAY)
