@@ -77,6 +77,8 @@ def draw_button_labels_locked(buttons, labels):
     code = buttons.blob_code(time.ticks_ms())
     for i, (x_pos, letter) in enumerate(
             ((30, "A"), (145, "B"), (hw.WIDTH - 90, "X"), (hw.WIDTH - 35, "Y"))):
+        if not labels[i]:
+            continue  # button does nothing on this screen — no circle, no blob
         blob = (code >> (2 * i)) & 3
         if blob == BLOB_LONG:
             display.set_pen(hw.BLUE)

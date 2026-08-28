@@ -112,6 +112,24 @@ def test_button_blobs():
     check("blue clears too", b.blob_code(now) == 0)
 
 
+def test_unlabeled_buttons_hidden():
+    # A button with no caption on a screen does nothing there — draw neither
+    # its circle nor its blob (brightness screen's A looked functional).
+    from app import hw, screens
+    from app.buttons import Buttons
+    b = Buttons()
+
+    def circles_drawn(labels):
+        start = len(hw.display.calls)
+        screens.draw_button_labels_locked(b, labels)
+        return sum(1 for name, _ in hw.display.calls[start:] if name == "circle")
+
+    check("all labeled -> four circles",
+          circles_drawn(("A1", "B1", "X1", "Y1")) == 4)
+    check("unlabeled buttons drawn without circles",
+          circles_drawn(("", "Back", "Up", "Down")) == 3)
+
+
 def test_run_action_busy_lifecycle():
     from app.app import App
     from app.buttons import BLOB_ACTIVE, EV_X_TAP
@@ -564,6 +582,7 @@ def main():
     for test in (test_imports, test_pure_helpers, test_ha_template,
                  test_button_queue, test_png_decoder,
                  test_button_blobs, test_run_action_busy_lifecycle,
+                 test_unlabeled_buttons_hidden,
                  test_art_pipeline_states, test_app_smoke,
                  test_media_command_during_download,
                  test_hapush_diff_merge, test_hapush_ping_ids_increase,
