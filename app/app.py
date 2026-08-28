@@ -116,7 +116,16 @@ class App:
         # on-device trace) — do NOT cancel the download here. Cancelling per
         # press churned TCP connections until lwIP ran out of sockets
         # (OSError 12) and the art never finished downloading.
-        if not await self.ha.call_service(service, self.current_speaker):
+        ok = False
+        push = self.push  # session may end mid-await; keep a local ref
+        if push is not None:
+            try:
+                ok = await push.call_service(service, self.current_speaker)
+            except (OSError, ValueError, asyncio.TimeoutError) as e:
+                log.debug("ws command failed, REST fallback: %r" % e)
+        if not ok:
+            ok = await self.ha.call_service(service, self.current_speaker)
+        if not ok:
             screens.show_message("HA Connection Error", scale=1)
             await asyncio.sleep(1)
             self.redraw_current()

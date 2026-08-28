@@ -278,6 +278,91 @@ def test_hapush_diff_merge():
     check("diff state + removal", st["state"] == "paused" and st["artist"] is None)
 
 
+def test_hapush_ws_call_service():
+    # call_service sends over the socket and the concurrent wait_update loop
+    # routes the result back by id. A failed command resolves that command
+    # (False) without killing the connection.
+    import json
+    from app.hapush import HAPush
+
+    sent = []
+
+    class FakeWS:
+        def __init__(self):
+            self.inbox = []
+
+        async def send(self, text):
+            msg = json.loads(text)
+            sent.append(msg)
+            if msg.get("type") == "call_service":
+                self.inbox.append(json.dumps(
+                    {"id": msg["id"], "type": "result",
+                     "success": msg["service"] != "bad_service"}))
+
+        async def recv(self, timeout):
+            if self.inbox:
+                return self.inbox.pop(0)
+            await asyncio.sleep(0.005)
+            raise asyncio.TimeoutError
+
+    push = HAPush()
+    push._ws = FakeWS()
+
+    async def run():
+        stop = [False]
+        loop_task = asyncio.create_task(push.wait_update(lambda: stop[0]))
+        ok = await push.call_service("volume_up", "media_player.k")
+        bad = await push.call_service("bad_service", "media_player.k")
+        stop[0] = True
+        await loop_task
+        check("ws command success", ok is True)
+        check("ws command failure returned, not fatal", bad is False)
+        check("command ids increase", sent[0]["id"] < sent[1]["id"])
+        check("command shape", sent[0]["type"] == "call_service"
+              and sent[0]["domain"] == "media_player"
+              and sent[0]["target"] == {"entity_id": "media_player.k"})
+        check("no pending leak", push._pending == {})
+
+    asyncio.run(run())
+
+
+def test_media_command_prefers_push():
+    # With a live push session, commands go over the websocket; REST is only
+    # the fallback when the socket is unusable.
+    from app.app import App
+
+    class FakePush:
+        def __init__(self, fail):
+            self.fail = fail
+            self.calls = []
+
+        async def call_service(self, service, entity_id, timeout=5):
+            self.calls.append(service)
+            if self.fail:
+                raise OSError("socket gone")
+            return True
+
+    async def run():
+        app = App()
+        fake = FakeHA()
+        app.ha = fake
+        app.current_speaker = "media_player.kitchen"
+        app.state = _mkstate()
+
+        app.push = FakePush(fail=False)
+        await app.media_command("volume_up")
+        check("push carries the command",
+              app.push.calls == ["volume_up"] and fake.services == [])
+
+        app.push = FakePush(fail=True)
+        await app.media_command("volume_down")
+        check("REST fallback on dead socket",
+              app.push.calls == ["volume_down"]
+              and fake.services == ["volume_down"])
+
+    asyncio.run(run())
+
+
 def test_hapush_ping_ids_increase():
     # Regression: every command on one connection needs a fresh, increasing
     # id. The second idle keepalive ping used to resend id 2 — real HA
@@ -427,6 +512,7 @@ def main():
                  test_art_pipeline_states, test_app_smoke,
                  test_media_command_during_download,
                  test_hapush_diff_merge, test_hapush_ping_ids_increase,
+                 test_hapush_ws_call_service, test_media_command_prefers_push,
                  test_websocket_end_to_end,
                  test_soak):
         test()

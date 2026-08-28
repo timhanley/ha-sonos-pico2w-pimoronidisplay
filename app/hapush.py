@@ -6,6 +6,11 @@
 # subscribe, then tiny diffs; between updates the link is idle, so idle
 # traffic is near zero versus 1 Hz REST polling.
 #
+# Media commands also go over this socket (call_service): no TCP setup per
+# press — roughly half the latency of a REST call, and none of the lwIP
+# connection churn. The concurrent wait_update() loop receives the result
+# messages and routes each to the awaiting call_service() by id.
+#
 # Memory: only the seven display-relevant fields are kept per speaker
 # (compact dicts, same shape as ha.get_state()); the full attribute payloads
 # are translated on arrival and discarded.
@@ -42,8 +47,9 @@ class HAPush:
     def __init__(self):
         self._host, self._port, _ = parse_url(HA_URL)
         self._ws = None
-        self._msg_id = 0  # HA requires strictly increasing ids per connection
-        self.states = {}  # entity_id -> compact state dict
+        self._msg_id = 0    # HA requires strictly increasing ids per connection
+        self._pending = {}  # msg id -> [Event, success] awaiting a result
+        self.states = {}    # entity_id -> compact state dict
         self.subscribed = ()
 
     def _next_id(self):
@@ -55,6 +61,7 @@ class HAPush:
         self._ws = await WebSocket.connect(
             self._host, self._port, "/api/websocket", timeout)
         self._msg_id = 0  # fresh connection, fresh id space
+        self._pending = {}
         try:
             msg = await self._recv_json(timeout)
             if msg.get("type") != "auth_required":
@@ -115,6 +122,24 @@ class HAPush:
             changed.add(entity_id)
         return changed
 
+    async def call_service(self, service, entity_id, timeout=5):
+        """Call a media_player service over the push socket. Returns HA's
+        success flag. Raises OSError/asyncio.TimeoutError when the socket is
+        unusable — caller falls back to REST. Requires a concurrent
+        wait_update() loop: that is what receives the result message."""
+        msg_id = self._next_id()
+        slot = [asyncio.Event(), False]
+        self._pending[msg_id] = slot
+        try:
+            await self._ws.send(json.dumps(
+                {"id": msg_id, "type": "call_service",
+                 "domain": "media_player", "service": service,
+                 "target": {"entity_id": entity_id}}))
+            await asyncio.wait_for(slot[0].wait(), timeout)
+            return slot[1]
+        finally:
+            self._pending.pop(msg_id, None)
+
     async def wait_update(self, should_stop):
         """Block until entity states change; return the set of changed
         entity_ids, or None when should_stop() turned true. Raises OSError
@@ -147,9 +172,16 @@ class HAPush:
                 changed = self._handle_event(msg.get("event", {}))
                 if changed:
                     return changed
-            elif msg_type == "result" and not msg.get("success", True):
-                # any command's failure result lands here (subscribe, ping, …)
-                raise OSError("ws command failed: %s" % msg.get("error"))
+            elif msg_type == "result":
+                slot = self._pending.pop(msg.get("id"), None)
+                if slot is not None:
+                    # a call_service() is awaiting this — its failure is its
+                    # own problem, not the connection's
+                    slot[1] = bool(msg.get("success"))
+                    slot[0].set()
+                elif not msg.get("success", True):
+                    # subscribe/ping failures are connection-fatal
+                    raise OSError("ws command failed: %s" % msg.get("error"))
             # pong / result-ok / anything else: liveness only
 
     def close(self):
