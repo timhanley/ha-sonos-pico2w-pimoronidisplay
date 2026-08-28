@@ -74,6 +74,13 @@ def test_button_queue():
     b._push(EV_A_SHORT)
     b.clear()
     check("clear discards", b.get_events() == ())
+    # Regression: events that sat queued while Core 0 was stuck must not
+    # replay as a burst once it unblocks.
+    import time
+    b._push(EV_A_SHORT)
+    b._push(EV_X_TAP)
+    b._q[0] = (b._q[0][0], time.ticks_ms() - 2000)  # backdate the first
+    check("stale events dropped, fresh kept", b.get_events() == [EV_X_TAP])
 
 
 def test_png_decoder():
@@ -224,6 +231,31 @@ def test_app_smoke():
         app.playback_screen.update(None)
         app.playback_screen.update(None)
         check("error screen drawn once", hw.display.update_count == before + 1)
+
+    asyncio.run(run())
+
+
+def test_media_command_yields_socket():
+    # Regression: a button command during an art download must cancel the
+    # download (one CYW43 HTTP connection at a time) instead of stalling the
+    # action loop behind a competing connection, and must force a full
+    # redraw so the art zone restarts the download afterwards.
+    from app import artwork
+    from app.app import App
+
+    async def run():
+        app = App()
+        fake = FakeHA()
+        app.ha = fake
+        app.current_speaker = "media_player.kitchen"
+        app.state = _mkstate()
+        app.playback_screen.prev_visible = ("anything",)
+        app.art.state = artwork.DOWNLOADING
+        await app.media_command("volume_up")
+        check("download cancelled for command", app.art.state == artwork.IDLE)
+        check("command still sent", fake.services == ["volume_up"])
+        check("full redraw forced for art restart",
+              app.playback_screen.prev_visible is None)
 
     asyncio.run(run())
 
@@ -396,6 +428,7 @@ def main():
     for test in (test_imports, test_pure_helpers, test_ha_template,
                  test_button_queue, test_png_decoder,
                  test_art_pipeline_states, test_app_smoke,
+                 test_media_command_yields_socket,
                  test_hapush_diff_merge, test_hapush_ping_ids_increase,
                  test_websocket_end_to_end,
                  test_soak):

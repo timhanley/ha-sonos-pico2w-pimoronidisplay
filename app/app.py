@@ -112,6 +112,15 @@ class App:
     async def media_command(self, service):
         if not self.current_speaker:
             return
+        if self.art.state == DOWNLOADING:
+            # The download holds the CYW43's one HTTP connection; competing
+            # with it stalls the command (and the whole action loop) for up
+            # to HTTP_TIMEOUT. User action wins: cancel the download, let the
+            # cancelled task close its socket, and force a full redraw so the
+            # art zone's maybe_start restarts it after the command.
+            self.art.cancel()
+            self.playback_screen.invalidate()
+            await asyncio.sleep(0.01)
         if not await self.ha.call_service(service, self.current_speaker):
             screens.show_message("HA Connection Error", scale=1)
             await asyncio.sleep(1)

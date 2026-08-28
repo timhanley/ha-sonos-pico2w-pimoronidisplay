@@ -30,6 +30,7 @@ EV_Y_TAP = 5     # volume down / menu down
 LONG_PRESS_MS = 1000
 FEEDBACK_MS = 200      # how long the green press blob lingers after release
 _POLL_MS = 5
+STALE_EVENT_MS = 1500  # events queued longer than this are dropped at drain
 
 
 class Buttons:
@@ -60,14 +61,20 @@ class Buttons:
         time.sleep_ms(4 * _POLL_MS)
 
     def get_events(self):
-        """Drain and return all pending events (possibly empty list)."""
+        """Drain and return all pending events (possibly empty list).
+
+        Events that sat queued longer than STALE_EVENT_MS are dropped: they
+        were pressed while Core 0 was stuck (e.g. a network stall) and
+        replaying them later would fire a burst of surprise actions."""
         if not self._q:
             return ()
         self._qlock.acquire()
-        events = self._q
+        entries = self._q
         self._q = []
         self._qlock.release()
-        return events
+        now = time.ticks_ms()
+        return [ev for ev, t in entries
+                if time.ticks_diff(now, t) <= STALE_EVENT_MS]
 
     def clear(self):
         """Discard pending events (e.g. the press that woke the device)."""
@@ -92,7 +99,7 @@ class Buttons:
 
     def _push(self, ev):
         self._qlock.acquire()
-        self._q.append(ev)
+        self._q.append((ev, time.ticks_ms()))
         self._qlock.release()
         self.flag.set()
 
