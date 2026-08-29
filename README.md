@@ -79,6 +79,8 @@ app/
    mpremote cp config.py :config.py
    ```
    (Close Thonny or any other serial connection first — it holds the port.)
+
+   Alternatively, `make deploy-mpy` deploys precompiled `.mpy` bytecode instead of source — faster boot and less heap fragmentation, since the device skips compiling ~90 KB of Python. It requires `mpy-cross` matching the firmware's MicroPython version (`pip install mpy-cross==<version>.*`); don't mix it with `make deploy` on the same device without redeploying fully, as it clears `:app` first to avoid stale files.
 3. Ensure Home Assistant has the Sonos integration installed and configured.
 4. Reset the Pico to start the application (`make reset`).
 
