@@ -1,4 +1,5 @@
-config.py
+# Root config only — tests/mpy_stubs/config.py must stay tracked (CI needs it).
+/config.py
 __pycache__/
 .DS_Store
 brightness.json
